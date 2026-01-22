@@ -27,7 +27,7 @@ class AscendAttentionState(Enum):
     PrefillNoCache = 0
     PrefillCacheHit = 1
     DecodeOnly = 2
-    ChunkdPrefill = 3
+    ChunkedPrefill = 3
     SpecDecoding = 4
 
 @dataclasses.dataclass
@@ -348,9 +348,9 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
                 # print('-updatenum_batch', num_batch)
                 # print('-updatequery', query.shape)
                 # print('-updatequery[:cu_seqlen_q[-1]]', query[:cu_seqlen_q[-1]].shape)
-                # print('-updatequery_metadata.block_tables', attn_metadata.block_tables.shape)
+                # print('-updateattn_metadata.block_tables', attn_metadata.block_tables.shape)
                 # print('-updateactual_seq_lengths-cu_seqlen_q', cu_seqlen_q)
-                # print('-updateactual_seq_lengths-attn_metadata.actual_seq_length_q', attn_metadata.actual_seq_lengths_q )
+                # print('-updateactual_seq_lengths-attn_metadata.actual_seq_lengths_q', attn_metadata.actual_seq_lengths_q )
                 # print('-[output[:num_batch], softmax_lse]', output[:num_batch].shape)
                 # print('softmax_lse',softmax_lse.shape)
                 
