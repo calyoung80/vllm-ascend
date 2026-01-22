@@ -14,6 +14,10 @@ def forward(
     # shape does not match the query shape, so we optionally let the model
     # definition specify the output tensor shape.
     output_shape: Optional[torch.Size] = None,
+    k_norm_weight: Optional[torch.Tensor] = None,
+    k_norm_eps: Optional[float] = None,
+    cos: Optional[torch.Tensor] = None,
+    sin: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     The KV cache is stored inside this class and is accessed via
@@ -70,7 +74,11 @@ def forward(
                               value,
                               self_kv_cache,
                               attn_metadata,
-                              output=output)
+                              output=output,
+                              k_norm_weight = k_norm_weight,
+                              k_norm_eps = k_norm_eps,
+                              cos = cos,
+                              sin = sin)
         else:
             torch.ops.vllm.unified_attention_with_output(
                 query, key, value, output, self.layer_name)

@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from unittest.mock import patch
+from enum import Enum
 
 import torch
 import torch_npu
@@ -17,9 +18,17 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
+#from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 from ..utils import weak_ref_tensors
 from vllm_ascend.attention.utils import using_paged_attention
+
+class AscendAttentionState(Enum):
+    PrefillNoCache = 0
+    PrefillCacheHit = 1
+    DecodeOnly = 2
+    ChunkdPrefill = 3
+    SpecDecoding = 4
 
 @dataclasses.dataclass
 class ACLGraphEntry:
@@ -128,7 +137,7 @@ class ACLGraphWrapper:
                 logger.debug("Capturing a aclgraph on (%s,%s)",
                              self.runtime_mode.name, entry.batch_descriptor)
             # validate that aclgraph capturing is legal at this point.
-            validate_cudagraph_capturing_enabled()
+            #validate_cudagraph_capturing_enabled()
 
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -279,13 +288,13 @@ def _update_attn_pa_params(update_stream,
                 attn_metadata = forward_context.attn_metadata[key]
                 num_batch = attn_metadata.query_lens.shape[0]
 
-                print(f"key {key} !!!!!!!!!")
-                print(f"query.shape[0] {query.shape[0]} !!!!!!!!!")
-                print(f"_update_attn_fia_params num_batch {num_batch} !!!!!!!!!")
-                print(f"attn_metadata.seq_lens_list[:num_batch] : {attn_metadata.seq_lens_list[:num_batch]}")
-                print(f"attn_metadata.seq_lens[:num_batch] : {attn_metadata.seq_lens[:num_batch]}")
-                print(f"block_table[:num_batch,0:200] : {block_table[:num_batch,0:200]}  {block_table.shape}")
-                print(f"attn_metadata.slot_mapping : {attn_metadata.slot_mapping}  ")
+                # print(f"key {key} !!!!!!!!!")
+                # print(f"query.shape[0] {query.shape[0]} !!!!!!!!!")
+                # print(f"_update_attn_fia_params num_batch {num_batch} !!!!!!!!!")
+                # print(f"attn_metadata.seq_lens_list[:num_batch] : {attn_metadata.seq_lens_list[:num_batch]}")
+                # print(f"attn_metadata.seq_lens[:num_batch] : {attn_metadata.seq_lens[:num_batch]}")
+                # print(f"block_table[:num_batch,0:200] : {block_table[:num_batch,0:200]}  {block_table.shape}")
+                # print(f"attn_metadata.slot_mapping : {attn_metadata.slot_mapping}  ")
 
                 workspace = torch_npu._npu_paged_attention_get_workspace(
                     query=query,
@@ -322,71 +331,123 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape):
                 graph_params.handles[runtime_shape],
                 graph_params.events[runtime_shape],
         ):
-            (query, key_cache, value, 
-             num_heads, num_kv_heads, attn_mask, 
-             sparse_mode, input_layout, scale,
-             block_tables, block_size,
-             actual_seq_lengths, actual_seq_lengths_kv,
-             output, softmax_lse) = param
-
             attn_metadata = forward_context.attn_metadata[key]
-            num_batch = attn_metadata.query_lens.shape[0]
-            cu_seqlen_q = [i + 1 for i in range(num_batch)]
+            if attn_metadata.attn_state.value == 4:
+                (query, key_cache, value, 
+                num_heads, num_kv_heads, attn_mask, 
+                sparse_mode, input_layout, scale,
+                block_tables, block_size,
+                actual_seq_lengths, actual_seq_lengths_kv,
+                output, softmax_lse) = param
 
-#            num_tokens = query.shape[0]
-#            cu_seqlen_q_all = [i + 1 for i in range(num_tokens)]
-#            print(f"key {key} !!!!!!!!!")
-#            print(f"query.shape[0] {query.shape[0]} !!!!!!!!!")
-#            print(f"_update_attn_fia_params num_batch {num_batch} !!!!!!!!!")
-#            print(f"attn_metadata.seq_lens_list[:num_batch] : {attn_metadata.seq_lens_list[:num_batch]}")
-#            print(f"attn_metadata.seq_lens[:num_batch] : {attn_metadata.seq_lens[:num_batch]}")
-#            print(f"attn_metadata.block_tables[:num_batch,0:200] : {attn_metadata.block_tables[:num_batch,0:200]}  {attn_metadata.block_tables.shape}")
-#            print(f"attn_metadata.slot_mapping : {attn_metadata.slot_mapping}  ")
-            
-            # seq_lens_list = attn_metadata.seq_lens.tolist()
+                attn_metadata = forward_context.attn_metadata[key]
+                num_batch = attn_metadata.query_lens.shape[0]
+                # cu_seqlen_q = [i + 1 for i in range(num_batch)]
+                cu_seqlen_q = [(i + 1)*2 for i in range(num_batch)] # else必须运行这个
+                # print('in-update')
+                # print('-updatenum_batch', num_batch)
+                # print('-updatequery', query.shape)
+                # print('-updatequery[:cu_seqlen_q[-1]]', query[:cu_seqlen_q[-1]].shape)
+                # print('-updatequery_metadata.block_tables', attn_metadata.block_tables.shape)
+                # print('-updateactual_seq_lengths-cu_seqlen_q', cu_seqlen_q)
+                # print('-updateactual_seq_lengths-attn_metadata.actual_seq_length_q', attn_metadata.actual_seq_lengths_q )
+                # print('-[output[:num_batch], softmax_lse]', output[:num_batch].shape)
+                # print('softmax_lse',softmax_lse.shape)
+                
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query[:cu_seqlen_q[-1]],
+                    #query = query[:num_batch],
+                    key=key_cache.view(-1, block_size, num_kv_heads * 192),
+                    value=value.view(-1, block_size, num_kv_heads * 128),
+                    num_heads=num_heads,
+                    num_key_value_heads=num_kv_heads,
+                    atten_mask=attn_mask,
+                    sparse_mode=sparse_mode,
+                    input_layout=input_layout,
+                    scale=scale,
+                    #block_table=attn_metadata.block_tables[:num_batch],
+                    block_table=attn_metadata.block_tables,
+                    block_size=block_size,
+                    #actual_seq_lengths=cu_seqlen_q,
+                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_batch],
+                    # out=[output[:num_batch*2], softmax_lse],
+                    # out=[output[:num_batch*2], softmax_lse],
+                    out=[output[:cu_seqlen_q[-1]], softmax_lse],
+                    workspace=graph_params.workspaces.get(runtime_shape),
+                )
 
-            torch.npu.graph_task_update_begin(update_stream, handle)
-            torch_npu.npu_fused_infer_attention_score.out(
-                query=query[:num_batch],
-                key=key_cache.view(-1, block_size, num_kv_heads * 192),
-                value=value.view(-1, block_size, num_kv_heads * 128),
-                num_heads=num_heads,
-                num_key_value_heads=num_kv_heads,
-                atten_mask=attn_mask,
-                sparse_mode=sparse_mode,
-                input_layout=input_layout,
-                scale=scale,
-                block_table=attn_metadata.block_tables[:num_batch],
-                block_size=block_size,
-                actual_seq_lengths=cu_seqlen_q,
-                actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_batch],
-                out=[output[:num_batch], softmax_lse],
-                workspace=graph_params.workspaces.get(runtime_shape),
-            )
+                torch.npu.graph_task_update_end(update_stream)
+
+                event.record(update_stream)
+            else:
+                # print('im in else -update')
+                (query, key_cache, value, 
+                num_heads, num_kv_heads, attn_mask, 
+                sparse_mode, input_layout, scale,
+                block_tables, block_size,
+                actual_seq_lengths, actual_seq_lengths_kv,
+                output, softmax_lse) = param
+
+                attn_metadata = forward_context.attn_metadata[key]
+                num_batch = attn_metadata.query_lens.shape[0]
+                cu_seqlen_q = [i + 1 for i in range(num_batch)]
+
+    #            num_tokens = query.shape[0]
+    #            cu_seqlen_q_all = [i + 1 for i in range(num_tokens)]
+    #            print(f"key {key} !!!!!!!!!")
+    #            print(f"query.shape[0] {query.shape[0]} !!!!!!!!!")
+    #            print(f"_update_attn_fia_params num_batch {num_batch} !!!!!!!!!")
+    #            print(f"attn_metadata.seq_lens_list[:num_batch] : {attn_metadata.seq_lens_list[:num_batch]}")
+    #            print(f"attn_metadata.seq_lens[:num_batch] : {attn_metadata.seq_lens[:num_batch]}")
+    #            print(f"attn_metadata.block_tables[:num_batch,0:200] : {attn_metadata.block_tables[:num_batch,0:200]}  {attn_metadata.block_tables.shape}")
+    #            print(f"attn_metadata.slot_mapping : {attn_metadata.slot_mapping}  ")
+                
+                # seq_lens_list = attn_metadata.seq_lens.tolist()
+
+                torch.npu.graph_task_update_begin(update_stream, handle)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query[:num_batch],
+                    key=key_cache.view(-1, block_size, num_kv_heads * 192),
+                    value=value.view(-1, block_size, num_kv_heads * 128),
+                    num_heads=num_heads,
+                    num_key_value_heads=num_kv_heads,
+                    atten_mask=attn_mask,
+                    sparse_mode=sparse_mode,
+                    input_layout=input_layout,
+                    scale=scale,
+                    block_table=attn_metadata.block_tables[:num_batch],
+                    block_size=block_size,
+                    actual_seq_lengths=cu_seqlen_q,
+                    actual_seq_lengths_kv=attn_metadata.seq_lens_list[:num_batch],
+                    out=[output[:num_batch], softmax_lse],
+                    workspace=graph_params.workspaces.get(runtime_shape),
+                )
 
 
 
-#            torch_npu.npu_fused_infer_attention_score.out(
-#                query=query,
-#                key=key_cache.view(-1, block_size, num_kv_heads * 192),
-#                value=value.view(-1, block_size, num_kv_heads * 128),
-#                num_heads=num_heads,
-#                num_key_value_heads=num_kv_heads,
-#                atten_mask=attn_mask,
-#                sparse_mode=sparse_mode,
-#                input_layout=input_layout,
-#                scale=scale,
-#                block_table=attn_metadata.block_tables,
-#                block_size=block_size,
-#                actual_seq_lengths=cu_seqlen_q_all,
-#                actual_seq_lengths_kv=seq_lens_list,
-#                out=[output, softmax_lse],
-#                workspace=graph_params.workspaces.get(runtime_shape),
-#            )
-#
-            torch.npu.graph_task_update_end(update_stream)
+    #            torch_npu.npu_fused_infer_attention_score.out(
+    #                query=query,
+    #                key=key_cache.view(-1, block_size, num_kv_heads * 192),
+    #                value=value.view(-1, block_size, num_kv_heads * 128),
+    #                num_heads=num_heads,
+    #                num_key_value_heads=num_kv_heads,
+    #                atten_mask=attn_mask,
+    #                sparse_mode=sparse_mode,
+    #                input_layout=input_layout,
+    #                scale=scale,
+    #                block_table=attn_metadata.block_tables,
+    #                block_size=block_size,
+    #                actual_seq_lengths=cu_seqlen_q_all,
+    #                actual_seq_lengths_kv=seq_lens_list,
+    #                out=[output, softmax_lse],
+    #                workspace=graph_params.workspaces.get(runtime_shape),
+    #            )
+    #
+                torch.npu.graph_task_update_end(update_stream)
 
-            event.record(update_stream)
+                event.record(update_stream)
 
 def update_attn_params(update_stream, forward_context, runtime_shape,
                        vllm_config):

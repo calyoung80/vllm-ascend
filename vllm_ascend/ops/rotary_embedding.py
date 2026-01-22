@@ -132,6 +132,7 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         is_neox_style_override: Optional[bool] = None,
+        output_cos_sin: bool = False,
     ):
         is_neox_style = self.is_neox_style
         if is_neox_style_override is not None:
@@ -151,7 +152,10 @@ class AscendRotaryEmbedding(RotaryEmbedding):
                 self.sin = sin.view(1, -1, 1, last_dim).contiguous()
                 forward_context.is_first_layer = False
         elif self.head_size == 192:
-            return self.forward_native(positions, query, key)
+            return self.forward_native(positions, query, key, output_cos_sin = output_cos_sin)
+        if output_cos_sin:
+            return _rope_forward_oot(self, positions, query, key, is_neox_style, 
+                                     offsets), self.cos, self.sin
         return _rope_forward_oot(self, positions, query, key, is_neox_style,
                                  offsets)
 

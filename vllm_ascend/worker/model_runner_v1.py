@@ -815,7 +815,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
-        if self.dp_size == 1:
+        if True:
+        # if self.dp_size == 1:
             return num_tokens, None, with_prefill, enable_dbo
 
         # Sync num_tokens, with_prefill, enable_dbo across dp ranks
@@ -1292,7 +1293,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         (maybe_padded_num_tokens, num_tokens_across_dp, with_prefill,
          enable_dbo) = self._sync_metadata_across_dp(num_input_tokens,
                                                      with_prefill, enable_dbo)
-
+        #print('check-maybe_padded_num_tokens-sync',maybe_padded_num_tokens)
         # TODO: Now that num_input_tokens is basically identical with maybe_padded_num_tokens
         # We should consider removing maybe_padded_num_tokens later
         num_input_tokens = maybe_padded_num_tokens
@@ -1796,6 +1797,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def propose_draft_token_ids(
         self,
+        maybe_padded_num_tokens: None,
         valid_sampled_token_ids: list[list[int]],
         sampling_metadata: SamplingMetadata,
         scheduler_output: "SchedulerOutput",
@@ -1811,7 +1813,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             draft_token_ids = None
         else:
             draft_token_ids = self.drafter.generate_token_ids(
-                valid_sampled_token_ids, sampling_metadata, scheduler_output,
+                maybe_padded_num_tokens, valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,
                 hidden_states, attn_metadata, aux_hidden_states)
         return draft_token_ids
@@ -2192,6 +2194,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             if self.speculative_config:
                 self._draft_token_ids = self.propose_draft_token_ids(
+                    maybe_padded_num_tokens,
                     valid_sampled_token_ids,
                     sampling_metadata,
                     scheduler_output,
@@ -3550,22 +3553,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     "decode" if uniform_decode else "mixed prefill-decode",
                     aclgraph_runtime_mode.name))
         # We skip EPLB here since we don't want to record dummy metrics
-        for num_tokens in compilation_cases:
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
-                # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
-                # But be careful, warm up with `NONE`is orthogonal to
-                # if we want to warm up attention or not. This is
-                # different from the case where `FULL` implies capture
-                # attention while `PIECEWISE` implies no attention.
-                force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
-                self._dummy_run(num_tokens,
-                                aclgraph_runtime_mode=CUDAGraphMode.NONE,
-                                force_attention=force_attention,
-                                uniform_decode=uniform_decode)
-            self._dummy_run(num_tokens,
-                            aclgraph_runtime_mode=aclgraph_runtime_mode,
-                            force_attention=force_attention,
-                            uniform_decode=uniform_decode)
+        # for num_tokens in compilation_cases:
+        #     for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+        #         # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
+        #         # But be careful, warm up with `NONE`is orthogonal to
+        #         # if we want to warm up attention or not. This is
+        #         # different from the case where `FULL` implies capture
+        #         # attention while `PIECEWISE` implies no attention.
+        #         force_attention = (aclgraph_runtime_mode == CUDAGraphMode.FULL)
+        #         self._dummy_run(num_tokens,
+        #                         aclgraph_runtime_mode=CUDAGraphMode.NONE,
+        #                         force_attention=force_attention,
+        #                         uniform_decode=uniform_decode)
+        #     self._dummy_run(num_tokens,
+        #                     aclgraph_runtime_mode=aclgraph_runtime_mode,
+        #                     force_attention=force_attention,
+        #                     uniform_decode=uniform_decode)
 
     def _capture_model(self):
         if not self.use_aclgraph:

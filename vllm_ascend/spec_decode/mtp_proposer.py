@@ -28,6 +28,11 @@ from vllm_ascend.torchair.utils import (TORCHAIR_CACHE_DIR,
                                         TorchairCommonAttentionMetadata)
 from vllm_ascend.utils import ProfileExecuteDuration, lmhead_tp_enable
 
+from vllm_ascend.compilation.acl_graph import(ACLGraphWrapper,
+                                              set_graph_params,
+                                              update_attn_params,
+                                              update_mla_attn_params)
+
 PADDING_SLOT_ID = -1
 
 
@@ -198,6 +203,7 @@ class MtpProposer(Proposer):
                 break
 
     def generate_token_ids(self,
+                           maybe_padded_num_tokens,
                            valid_sampled_token_ids: list[list[int]],
                            sampling_metadata: SamplingMetadata = None,
                            scheduler_output: SchedulerOutput = None,
@@ -266,7 +272,8 @@ class MtpProposer(Proposer):
             cu_num_tokens=cu_num_tokens,
             block_table=attn_metadata.block_tables,
             sampling_metadata=sampling_metadata,
-            token_indices=accepted_token_indices)
+            token_indices=accepted_token_indices,
+            maybe_padded_num_tokens=maybe_padded_num_tokens)
         spec_token_ids = draft_token_ids.tolist()
         return spec_token_ids
 
@@ -332,6 +339,7 @@ class MtpProposer(Proposer):
 
     def _propose(
             self,
+            maybe_padded_num_tokens,
             # [num_tokens]
             target_token_ids: torch.Tensor,
             # [num_tokens]
@@ -480,6 +488,23 @@ class MtpProposer(Proposer):
                             positions=self.positions[:num_input_tokens],
                             hidden_states=self.hidden_states[:num_input_tokens]
                         )
+                        forward_context = get_forward_context()
+                        # if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                        if False:
+                            self.update_stream: torch.npu.Stream = torch.npu.Stream()
+                            # TODO: maybe_padded_num_tokens will be removed, use num_input_tokens instead
+                            if self.vllm_config.model_config.use_mla:
+                                #FIXME: Try using `auto_dispatch_capture=True`
+                                update_mla_attn_params(self.update_stream, forward_context,
+                                                       maybe_padded_num_tokens,
+                                                       self.speculative_config)
+                            else:
+                                # update_attn_params(self.update_stream, forward_context,
+                                #                    maybe_padded_num_tokens,
+                                #                    self.vllm_config.kv_transfer_config)
+                                update_attn_params(self.update_stream, forward_context,
+                                                   maybe_padded_num_tokens,
+                                                   self.vllm_config)
 
             num_indices = last_token_indices.shape[0]
             if lmhead_tp_enable():
