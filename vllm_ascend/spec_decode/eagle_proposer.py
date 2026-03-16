@@ -388,7 +388,7 @@ class SpecDecodeBaseProposer(EagleProposer):
                     : num_reqs * self.decode_threshold
                 ]
 
-            builder = self.runner.attn_groups[0][0].get_metadata_builder()
+            builder = self.draft_attn_groups[0].get_metadata_builder()
             # update the tensor's address for each step.
             for draft_step in range(self.num_speculative_tokens):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
@@ -559,6 +559,9 @@ class SpecDecodeBaseProposer(EagleProposer):
                 common_attn_metadata.num_reqs = num_reqs_padded
                 common_attn_metadata.query_start_loc = self.runner.query_start_loc.gpu[: num_reqs_padded + 1]
                 common_attn_metadata.query_start_loc_cpu = self.runner.query_start_loc.cpu[: num_reqs_padded + 1]
+                common_attn_metadata.block_table_tensor = self._pad_tensor(
+                    common_attn_metadata.block_table_tensor, num_reqs_padded
+                )
                 common_attn_metadata.seq_lens = self.runner.seq_lens.gpu[:num_reqs_padded]
                 common_attn_metadata.seq_lens_cpu = self.runner.seq_lens.cpu[:num_reqs_padded]
         else:
@@ -1119,21 +1122,31 @@ class SpecDecodeBaseProposer(EagleProposer):
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
         if draft_step == 1:
-            if aclgraph_runtime_mode == CUDAGraphMode.FULL and (pad_size := input_batch_size - batch_size) > 0:
+            if aclgraph_runtime_mode == CUDAGraphMode.FULL :
                 common_attn_metadata.num_reqs = input_batch_size
                 common_attn_metadata.block_table_tensor = self._pad_tensor(
-                    common_attn_metadata.block_table_tensor, pad_size
+                    common_attn_metadata.block_table_tensor, input_batch_size
                 )
-                common_attn_metadata.seq_lens = self._pad_tensor(common_attn_metadata.seq_lens, pad_size)
-                common_attn_metadata.seq_lens_cpu = self._pad_tensor(common_attn_metadata.seq_lens_cpu, pad_size)
+                common_attn_metadata.seq_lens = self._pad_tensor(common_attn_metadata.seq_lens, input_batch_size)
+                common_attn_metadata.seq_lens_cpu = self._pad_tensor(common_attn_metadata.seq_lens_cpu, input_batch_size)
                 common_attn_metadata.num_computed_tokens_cpu = self._pad_tensor(
-                    common_attn_metadata.num_computed_tokens_cpu, pad_size
+                    common_attn_metadata.num_computed_tokens_cpu, input_batch_size
                 )
                 common_attn_metadata.query_start_loc = self.arange[: input_batch_size + 1]
                 common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                     self.token_arange_np[: input_batch_size + 1]
                 ).clone()
             else:
+                common_attn_metadata.num_reqs = batch_size
+                common_attn_metadata.block_table_tensor = self._pad_tensor(
+                    common_attn_metadata.block_table_tensor, batch_size
+                )
+                common_attn_metadata.seq_lens = self._pad_tensor(common_attn_metadata.seq_lens, batch_size)
+                common_attn_metadata.seq_lens_cpu = self._pad_tensor(common_attn_metadata.seq_lens_cpu, batch_size)
+                common_attn_metadata.num_computed_tokens_cpu = self._pad_tensor(
+                    common_attn_metadata.num_computed_tokens_cpu, batch_size
+                )
+
                 common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
                 common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                     self.token_arange_np[: batch_size + 1]
@@ -1560,7 +1573,7 @@ class SpecDecodeBaseProposer(EagleProposer):
     # update full-graph params for one spec token
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
         update_full_graph_params(
-            self.runner.attn_backend,
+            self.draft_attn_groups[0].backend,
             self.update_stream,
             forward_context,
             num_tokens,
@@ -1570,9 +1583,14 @@ class SpecDecodeBaseProposer(EagleProposer):
         )
 
     # padding tensor into desired size
-    def _pad_tensor(self, tensor, pad_size):
-        pad = [0] * (2 * tensor.dim() - 1) + [pad_size]
-        padded_tensor = F.pad(tensor, pad, mode="constant", value=0)
+    def _pad_tensor(self, tensor, desired_size):
+        pad_size = desired_size - tensor.shape[0]
+        if pad_size > 0:
+            pad = [0] * (2 * tensor.dim() - 1) + [pad_size]
+            padded_tensor = F.pad(tensor, pad, mode="constant", value=0)
+        else:
+            padded_tensor = tensor
+            
         return padded_tensor
 
     def maybe_pad_and_reduce(
