@@ -252,15 +252,14 @@ class NPUInputBatch(InputBatch):
 
     def add_request(self, request):
         req_index = super().add_request(request)
-        if request.sampling_params is not None:
-            seed = request.sampling_params.seed
-            if seed is None:
-                seed = np.random.randint(
-                    np.iinfo(np.int64).min,
-                    np.iinfo(np.int64).max,
-                    dtype=np.int64,
-                )
-            self.seed_by_req_id[request.req_id] = np.int64(seed)
+        seed = request.sampling_params.seed if request.sampling_params is not None else None
+        if seed is None:
+            seed = np.random.randint(
+                np.iinfo(np.int64).min,
+                np.iinfo(np.int64).max,
+                dtype=np.int64,
+            )
+        self.seed_by_req_id[request.req_id] = np.int64(seed)
         return req_index
 
     def remove_request(self, req_id: str):
@@ -273,6 +272,14 @@ class NPUInputBatch(InputBatch):
         sampling_metadata = super()._make_sampling_metadata()
         num_reqs = self.num_reqs
         if num_reqs > 0:
+            # Keep seeds aligned with req_ids even when req state is resumed/migrated.
+            for req_id in self.req_ids:
+                if req_id not in self.seed_by_req_id:
+                    self.seed_by_req_id[req_id] = np.random.randint(
+                        np.iinfo(np.int64).min,
+                        np.iinfo(np.int64).max,
+                        dtype=np.int64,
+                    )
             self.seed_cpu[:num_reqs] = np.array(
                 [self.seed_by_req_id[req_id] for req_id in self.req_ids],
                 dtype=np.int64,

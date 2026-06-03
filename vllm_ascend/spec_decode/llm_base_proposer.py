@@ -57,6 +57,14 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 
 
+def _log_sample_trace(message: str, **kwargs) -> None:
+    if kwargs:
+        details = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        logger.info("[sample-trace][drafter] %s | %s", message, details)
+    else:
+        logger.info("[sample-trace][drafter] %s", message)
+
+
 # TODO: Remove it when the bug of fx-graph is solved
 # patch vllm_config to be in CompilationMode.NONE temporarily
 @contextmanager
@@ -752,8 +760,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.method == "mtp" and getattr(self, "fused_with_main_graph", False):
                 logger.info("MTP fused with main graph; skip independent drafter ACLGraphWrapper.")
             else:
+                runnable = self._run_merged_draft
+                if self.use_eagle:
+                    def runnable(*args, **kwargs):
+                        return self._run_merged_draft(*args, **kwargs)
+
+                    setattr(
+                        runnable,
+                        "stabilize_aclgraph_output",
+                        not self.runner._fused_mtp_full_graph_enabled(),
+                    )
+                    setattr(
+                        runnable,
+                        "skip_draft_eagle_replay_sync",
+                        self.runner._fused_mtp_full_graph_enabled(),
+                    )
                 self._runnable = ACLGraphWrapper(
-                    self._run_merged_draft,
+                    runnable,
                     self.vllm_config,
                     runtime_mode=CUDAGraphMode.FULL,
                     use_eagle=self.use_eagle,
@@ -1181,6 +1204,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_scheduled_tokens: int = 0,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _log_sample_trace(
+            "_propose_enter",
+            method=self.method,
+            target_token_rows=target_token_ids.shape[0],
+            next_token_rows=next_token_ids.shape[0],
+            token_indices_to_sample_is_none=token_indices_to_sample is None,
+            num_scheduled_tokens=num_scheduled_tokens,
+        )
         batch_size = common_attn_metadata.batch_size()
 
         if token_indices_to_sample is None:
@@ -1494,6 +1525,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+        _log_sample_trace(
+            "_propose_exit",
+            method=self.method,
+            draft_rows=draft_token_ids.shape[0] if torch.is_tensor(draft_token_ids) else -1,
+            draft_cols=draft_token_ids.shape[1] if torch.is_tensor(draft_token_ids) and draft_token_ids.ndim > 1 else -1,
+        )
         return draft_token_ids
 
     def _run_merged_draft(
@@ -2155,6 +2192,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         This function must use device functions to operate on the inputs, and
         should not introduce any blocking CPU-GPU synchronization.
         """
+        _log_sample_trace(
+            "prepare_next_token_ids_padded_enter",
+            method=self.method,
+            sampled_rows=sampled_token_ids.shape[0],
+            sampled_cols=sampled_token_ids.shape[1],
+            num_discarded_requests=num_discarded_requests,
+        )
         # TODO(Ben): Combine this into a custom fused kernel
 
         # Precompute get_token_id for when there is no valid next token
@@ -2193,6 +2237,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.backup_next_token_ids.gpu[:batch_size],
         )
 
+        _log_sample_trace(
+            "prepare_next_token_ids_padded_exit",
+            method=self.method,
+            next_token_rows=next_token_ids.shape[0],
+            valid_count_rows=valid_sampled_tokens_count.shape[0],
+        )
         return next_token_ids, valid_sampled_tokens_count
 
     def prepare_inputs(

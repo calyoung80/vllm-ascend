@@ -1,10 +1,12 @@
 import torch
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.penalties import apply_all_penalties
@@ -14,6 +16,14 @@ from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 
 _SAMPLING_EPS = 1e-5
+
+
+def _log_sample_trace(message: str, **kwargs) -> None:
+    if kwargs:
+        details = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        logger.info("[sample-trace][sampler] %s | %s", message, details)
+    else:
+        logger.info("[sample-trace][sampler] %s", message)
 
 
 def random_sample(
@@ -29,6 +39,12 @@ def random_sample(
     # which is the common case, we first assume that every request does
     # not have its own seed. Then, we overwrite the values for the requests
     # that have their own seeds.
+    _log_sample_trace(
+        "random_sample_enter",
+        rows=probs.shape[0],
+        cols=probs.shape[1],
+        generator_count=len(generators),
+    )
     with npu_stream_switch(global_stream()):
         q = torch.empty_like(probs)
         if len(generators) != probs.shape[0]:
@@ -39,6 +55,7 @@ def random_sample(
             for i, generator in generators.items():
                 q[i].exponential_(generator=generator)
     torch.npu.current_stream().wait_stream(global_stream())
+    _log_sample_trace("random_sample_ready")
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
@@ -223,6 +240,86 @@ class AscendSampler(Sampler):
         self.topk_topp_sampler = AscendTopKTopPSampler(logprobs_mode=logprobs_mode)
         self.async_exponential_event = torch.npu.Event()
 
+    def forward(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool = False,
+        logprobs_mode_override=None,
+    ) -> SamplerOutput:
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        _log_sample_trace(
+            "forward_enter",
+            logits_rows=logits.shape[0],
+            logits_cols=logits.shape[1],
+            predict_bonus_token=predict_bonus_token,
+            max_num_logprobs=sampling_metadata.max_num_logprobs,
+            logprobs_mode=logprobs_mode,
+        )
+        num_logprobs = sampling_metadata.max_num_logprobs
+        if num_logprobs is not None:
+            if logprobs_mode == "raw_logprobs":
+                raw_logprobs = self.compute_logprobs(logits)
+            elif logprobs_mode == "raw_logits":
+                if logits.dtype == torch.float32:
+                    raw_logprobs = logits.clone()
+                else:
+                    raw_logprobs = logits.to(torch.float32)
+
+        logits = logits.to(torch.float32)
+        logits = self.apply_logits_processors(
+            logits, sampling_metadata, predict_bonus_token)
+        _log_sample_trace("forward_after_logits_processors")
+
+        sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+        _log_sample_trace(
+            "forward_after_sample",
+            sampled_rows=sampled.shape[0],
+            sampled_dtype=str(sampled.dtype),
+            processed_logprobs=processed_logprobs is not None,
+        )
+        if processed_logprobs is not None:
+            raw_logprobs = processed_logprobs
+
+        sampled = sampled.long()
+        _log_sample_trace("forward_after_long_cast")
+
+        logprob_token_ids_tensors = None
+        if sampling_metadata.logprob_token_ids:
+            logprob_token_ids_tensors = self.gather_specific_token_logprobs(
+                logits, sampling_metadata.logprob_token_ids, sampled
+            )
+            _log_sample_trace("forward_specific_logprob_ids")
+
+        if num_logprobs is None:
+            logprobs_tensors = logprob_token_ids_tensors
+        elif num_logprobs == -1:
+            logprobs_tensors = LogprobsTensors(
+                torch.empty(0), raw_logprobs, torch.empty(0)
+            )
+        else:
+            logprobs_tensors = self.gather_logprobs(
+                raw_logprobs, num_logprobs, token_ids=sampled
+            )
+            _log_sample_trace("forward_gather_logprobs")
+
+        if logprob_token_ids_tensors is not None and num_logprobs is not None:
+            logprobs_tensors = logprob_token_ids_tensors
+
+        sampled = sampled.to(torch.int32)
+        sampler_output = SamplerOutput(
+            sampled_token_ids=sampled.unsqueeze(-1).contiguous(),
+            logprobs_tensors=logprobs_tensors,
+        )
+        _log_sample_trace(
+            "forward_exit",
+            sampled_rows=sampler_output.sampled_token_ids.shape[0],
+            sampled_cols=sampler_output.sampled_token_ids.shape[1],
+            sampled_dtype=str(sampler_output.sampled_token_ids.dtype),
+            has_logprobs=logprobs_tensors is not None,
+        )
+        return sampler_output
+
     def set_q_event(self, q, event):
         self.topk_topp_sampler.set_q_event(q, event)
 
@@ -231,7 +328,19 @@ class AscendSampler(Sampler):
 
     def do_async_exponential(self, b_s, head_dim, generators):
         if self.uses_seeded_gumbel:
+            _log_sample_trace(
+                "skip_async_exponential",
+                reason="seeded_gumbel_active",
+                batch_size=b_s,
+                head_dim=head_dim,
+            )
             return
+        _log_sample_trace(
+            "run_async_exponential",
+            batch_size=b_s,
+            head_dim=head_dim,
+            generator_count=len(generators),
+        )
         # Calculating exponential randoms in a different stream
         # and overlapping with model executing.
         with torch.npu.stream(global_stream()):
@@ -252,13 +361,31 @@ class AscendSampler(Sampler):
         sampling_metadata: SamplingMetadata,
         logprobs_mode_override=None,
     ):
+        if getattr(sampling_metadata, "_ascend_disable_runtime_sampling", False):
+            _log_sample_trace(
+                "seeded_gumbel_disabled",
+                reason="runtime_sampling_disabled_for_path",
+            )
+            return None
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         positions = getattr(sampling_metadata, "_ascend_positions", None)
         idx_mapping = getattr(sampling_metadata, "_ascend_idx_mapping", None)
         seeds = getattr(sampling_metadata, "seeds", None)
         if positions is None or idx_mapping is None or seeds is None:
+            _log_sample_trace(
+                "seeded_gumbel_unavailable",
+                has_positions=positions is not None,
+                has_idx_mapping=idx_mapping is not None,
+                has_seeds=seeds is not None,
+            )
             return None
         needed = max(int(idx_mapping.shape[0]), 1)
+        _log_sample_trace(
+            "seeded_gumbel_enter",
+            needed=needed,
+            logits_rows=logits.shape[0],
+            vocab=logits.shape[1],
+        )
 
         all_greedy = sampling_metadata.all_greedy
         all_random = sampling_metadata.all_random and not all_greedy
@@ -282,6 +409,7 @@ class AscendSampler(Sampler):
         else:
             greedy_sampled = self.greedy_sample(logits)
             if all_greedy:
+                _log_sample_trace("seeded_gumbel_all_greedy")
                 processed_logprobs = None
                 if sampling_metadata.max_num_logprobs is not None:
                     if logprobs_mode == "processed_logits":
@@ -304,6 +432,11 @@ class AscendSampler(Sampler):
             logits = processor.apply(logits)
 
         if sampling_metadata.top_k is not None or sampling_metadata.top_p is not None:
+            _log_sample_trace(
+                "seeded_gumbel_apply_topk_topp",
+                has_top_k=sampling_metadata.top_k is not None,
+                has_top_p=sampling_metadata.top_p is not None,
+            )
             top_k_base = _ensure_runtime_state_tensor(
                 sampling_metadata.top_k,
                 needed,
@@ -338,6 +471,7 @@ class AscendSampler(Sampler):
         )
 
         if greedy_sampled is None:
+            _log_sample_trace("seeded_gumbel_random_only")
             return random_sampled, processed_logprobs
 
         sampled = torch.where(
@@ -346,6 +480,7 @@ class AscendSampler(Sampler):
             random_sampled,
             out=greedy_sampled,
         )
+        _log_sample_trace("seeded_gumbel_mixed_complete")
         return sampled, processed_logprobs
 
     def sample(
@@ -356,8 +491,70 @@ class AscendSampler(Sampler):
     ):
         seeded = self._sample_seeded_gumbel(logits, sampling_metadata, logprobs_mode_override)
         if seeded is not None:
+            _log_sample_trace("sample_return_seeded_gumbel")
             return seeded
-        return super().sample(logits, sampling_metadata, logprobs_mode_override)
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
+        _log_sample_trace(
+            "sample_regular_enter",
+            all_greedy=sampling_metadata.all_greedy,
+            all_random=sampling_metadata.all_random,
+            has_temperature=sampling_metadata.temperature is not None,
+            has_top_k=sampling_metadata.top_k is not None,
+            has_top_p=sampling_metadata.top_p is not None,
+            argmax_invariant_count=len(
+                sampling_metadata.logitsprocs.argmax_invariant),
+        )
+        assert not (
+            sampling_metadata.all_greedy and sampling_metadata.all_random)
+        if sampling_metadata.all_random:
+            greedy_sampled = None
+        else:
+            greedy_sampled = self.greedy_sample(logits)
+            if sampling_metadata.all_greedy:
+                _log_sample_trace("sample_regular_all_greedy")
+                processed_logprobs = None
+                if sampling_metadata.max_num_logprobs is not None:
+                    if logprobs_mode == "processed_logits":
+                        processed_logprobs = logits
+                    elif logprobs_mode == "processed_logprobs":
+                        processed_logprobs = self.compute_logprobs(logits)
+                return greedy_sampled, processed_logprobs
+
+        assert sampling_metadata.temperature is not None
+        _log_sample_trace("sample_regular_apply_temperature")
+        logits = self.apply_temperature(
+            logits, sampling_metadata.temperature, sampling_metadata.all_random
+        )
+
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            logits = processor.apply(logits)
+        if sampling_metadata.logitsprocs.argmax_invariant:
+            _log_sample_trace("sample_regular_after_argmax_invariant")
+
+        _log_sample_trace("sample_regular_topk_topp_enter")
+        random_sampled, processed_logprobs = self.topk_topp_sampler(
+            logits,
+            sampling_metadata.generators,
+            sampling_metadata.top_k,
+            sampling_metadata.top_p,
+        )
+        _log_sample_trace(
+            "sample_regular_topk_topp_exit",
+            sampled_rows=random_sampled.shape[0],
+        )
+
+        if greedy_sampled is None:
+            _log_sample_trace("sample_regular_return_random")
+            return random_sampled, processed_logprobs
+
+        sampled = torch.where(
+            sampling_metadata.temperature < _SAMPLING_EPS,
+            greedy_sampled,
+            random_sampled,
+            out=greedy_sampled,
+        )
+        _log_sample_trace("sample_regular_return_mixed")
+        return sampled, processed_logprobs
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -389,6 +586,11 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         # Also pass in event to prevent synchronize errors.
         self.q = q
         self.async_event = event
+        _log_sample_trace(
+            "topk_topp_set_q_event",
+            q_rows=q.shape[0],
+            q_cols=q.shape[1],
+        )
 
     def prepare_sampling(self, top_k):
         if top_k is not None:
@@ -398,12 +600,23 @@ class AscendTopKTopPSampler(TopKTopPSampler):
 
     def forward_native(self, logits, generators, k, p):
         """Override pytorch native implementation to torch_npu"""
+        _log_sample_trace(
+            "topk_topp_forward_enter",
+            logits_rows=logits.shape[0],
+            logits_cols=logits.shape[1],
+            has_k=k is not None,
+            has_p=p is not None,
+            reduce_sample=get_ascend_config().enable_reduce_sample,
+            batch_invariant=envs.VLLM_BATCH_INVARIANT,
+        )
         # when batch_invariant mode is enabled, we should use vllm's implementation.
         # or it will make batch_invariant mode not working.
         if envs.VLLM_BATCH_INVARIANT:
+            _log_sample_trace("topk_topp_forward_super_batch_invariant")
             return super().forward_native(logits, generators, k, p)
 
         if get_ascend_config().enable_reduce_sample:
+            _log_sample_trace("topk_topp_forward_reduce_sample")
             cand_logits, cand_idx = self.apply_top_k_top_p(logits, k, p, self.top_k)
             logits_to_return = None
             if self.logprobs_mode == "processed_logits":
@@ -415,8 +628,13 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             pos = random_sample(probs, generators)  # [B]
 
             next_token = cand_idx.gather(dim=1, index=pos.unsqueeze(1)).squeeze(1)  # [B]
+            _log_sample_trace("topk_topp_forward_reduce_sample_done")
             return next_token, logits_to_return
         else:
+            _log_sample_trace(
+                "topk_topp_forward_native_path",
+                async_exponential=get_ascend_config().enable_async_exponential,
+            )
             logits = self.apply_top_k_top_p(logits, k, p)
             logits_to_return = None
             if self.logprobs_mode == "processed_logits":
@@ -427,8 +645,11 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             probs = logits.softmax(dim=-1, dtype=torch.float32)
             if get_ascend_config().enable_async_exponential:
                 # Add synchronize to prevent synchronize error.
+                _log_sample_trace("topk_topp_forward_wait_async_event")
                 self.async_event.synchronize()
+                _log_sample_trace("topk_topp_forward_async_event_ready")
                 return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
+            _log_sample_trace("topk_topp_forward_random_sample")
             return random_sample(probs, generators), logits_to_return
 
 
