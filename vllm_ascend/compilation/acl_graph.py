@@ -18,33 +18,10 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
-from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
-
-
-def _log_aclgraph_trace(message: str, **kwargs) -> None:
-    if kwargs:
-        details = ", ".join(f"{k}={v}" for k, v in kwargs.items())
-        logger.info("[sample-trace][aclgraph] %s | %s", message, details)
-    else:
-        logger.info("[sample-trace][aclgraph] %s", message)
-
-
-def _stabilize_replay_output(output: Any) -> Any:
-    if isinstance(output, torch.Tensor):
-        return output.contiguous().clone()
-    if isinstance(output, list):
-        return [_stabilize_replay_output(item) for item in output]
-    if isinstance(output, tuple):
-        return tuple(_stabilize_replay_output(item) for item in output)
-    if isinstance(output, IntermediateTensors):
-        return IntermediateTensors(
-            {key: _stabilize_replay_output(val) for key, val in output.tensors.items()}
-        )
-    return output
 
 
 @dataclasses.dataclass
@@ -129,10 +106,6 @@ class ACLGraphWrapper:
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
         return self.runnable
-
-    def is_captured(self, batch_descriptor: BatchDescriptor) -> bool:
-        entry = self.concrete_aclgraph_entries.get(batch_descriptor)
-        return entry is not None and entry.aclgraph is not None
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -233,26 +206,11 @@ class ACLGraphWrapper:
         # we do not need to synchronize.
         # When enable_enpu is on, model_runner orders update vs replay; skip here.
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
-        is_draft_eagle = (
-            _EXTRA_CTX.is_draft_model
-            and self.use_eagle
-            and getattr(self.runnable, "skip_draft_eagle_replay_sync", False)
-        )
+        is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
-        skip_replay_sync = getattr(self.runnable, "skip_aclgraph_replay_sync", False)
-        if not skip_replay_sync and not self.enable_enpu and need_sync:
+        if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
-        if getattr(self.runnable, "stabilize_aclgraph_output", False):
-            _log_aclgraph_trace(
-                "stabilize_replay_output_enter",
-                runtime_mode=self.runtime_mode.name,
-                use_eagle=self.use_eagle,
-                batch_descriptor=entry.batch_descriptor,
-            )
-            output = _stabilize_replay_output(entry.output)
-            _log_aclgraph_trace("stabilize_replay_output_exit")
-            return output
         return entry.output
 
 
@@ -274,44 +232,17 @@ def update_full_graph_params(
     speculative_config=None,
     num_dcp_pcp_tokens=None,
     draft_attn_metadatas=None,
-    draft_attn_layer_names=None,
 ):
-    update_stream.wait_stream(torch.npu.current_stream())
     impl_cls = attn_backend.get_impl_cls()
-    try:
-        if draft_attn_layer_names is None:
-            impl_cls.update_graph_params(
-                update_stream,
-                forward_context,
-                num_tokens,
-                vllm_config,
-                speculative_config,
-                num_dcp_pcp_tokens,
-                draft_attn_metadatas,
-            )
-        else:
-            impl_cls.update_graph_params(
-                update_stream,
-                forward_context,
-                num_tokens,
-                vllm_config,
-                speculative_config,
-                num_dcp_pcp_tokens,
-                draft_attn_metadatas,
-                draft_attn_layer_names=draft_attn_layer_names,
-            )
-    except TypeError as exc:
-        if "draft_attn_layer_names" not in str(exc):
-            raise
-        impl_cls.update_graph_params(
-            update_stream,
-            forward_context,
-            num_tokens,
-            vllm_config,
-            speculative_config,
-            num_dcp_pcp_tokens,
-            draft_attn_metadatas,
-        )
+    impl_cls.update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config,
+        speculative_config,
+        num_dcp_pcp_tokens,
+        draft_attn_metadatas,
+    )
 
     from vllm_ascend.ops.gdn import update_conv1d_graph_params
 
