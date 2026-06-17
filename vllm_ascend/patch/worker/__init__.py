@@ -19,6 +19,10 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.utils import is_310p, vllm_version_is
 
+# Worker processes can reach vLLM memory profiling before the platform-level
+# patch is applied in that process.
+import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
+
 # v2 model runner patches depend on upstream main APIs beyond v0.21.0.
 _V2_MODEL_RUNNER_SUPPORTED = not vllm_version_is("0.21.0")
 
