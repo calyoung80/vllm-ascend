@@ -1,12 +1,25 @@
 # mypy: ignore-errors
 import math
+import os
 
+import vllm.envs as envs
 import vllm.model_executor.models.config
 from vllm.logger import logger
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+
+
+def _disable_batch_invariant_for_hybrid_mamba() -> None:
+    if not envs.VLLM_BATCH_INVARIANT:
+        return
+
+    os.environ["VLLM_BATCH_INVARIANT"] = "0"
+    logger.warning(
+        "Disabling VLLM_BATCH_INVARIANT for hybrid attention/Mamba models "
+        "because the Mamba attention backend does not support batch-invariant mode."
+    )
 
 
 @classmethod
@@ -21,6 +34,8 @@ def verify_and_update_config(cls, vllm_config) -> None:
     Args:
         vllm_config: vLLM Config
     """
+    _disable_batch_invariant_for_hybrid_mamba()
+
     using_kv_transfer_with_hybrid = (
         not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and vllm_config.kv_transfer_config
     )

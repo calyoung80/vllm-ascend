@@ -80,6 +80,13 @@ def causal_conv1d_fn(
     query_start_loc: torch.Tensor | None = None,
     metadata: Any | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
+    null_block_id: int | None = None,
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int = 0,
+    validate_data: bool = False,
 ):
     """
     x: (batch, dim, seqlen) or (dim,cu_seq_len) for varlen
