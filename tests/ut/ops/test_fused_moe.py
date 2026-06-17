@@ -31,6 +31,7 @@ from vllm_ascend.ops.fused_moe.fused_moe import (
     AscendFusedMoE,
     AscendMoERunner,
     AscendUnquantizedFusedMoEMethod,
+    _allow_nongated_moe_constructor_on_ascend,
 )
 from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -542,12 +543,13 @@ class TestAscendMoERunner:
         router_logits = torch.randn(2, 3)
         layer.forward_impl.return_value = "routed"
         layer.shared_forward_impl.return_value = ("shared", "routed")
+        shared_input = torch.randn(2, 5)
 
-        result = runner.forward_impl(layer, hidden_states, router_logits, None)
+        result = runner.forward_impl(layer, hidden_states, router_logits, shared_input)
 
         if has_shared_experts:
             assert result == ("shared", "routed")
-            layer.shared_forward_impl.assert_called_once_with(hidden_states, router_logits)
+            layer.shared_forward_impl.assert_called_once_with(hidden_states, router_logits, shared_input)
             layer.forward_impl.assert_not_called()
         else:
             assert result == "routed"
@@ -616,7 +618,7 @@ class TestAscendFusedMoE:
         layer.num_expert_group = None
         layer.custom_routing_function = None
         layer.scoring_func = "softmax"
-        layer._original_routed_scaling_factor = 1.0
+        layer._original_routed_scaling_factor = 5.0
         layer.routed_scaling_factor = 1.0
         layer.e_score_correction_bias = None
         layer.activation = "silu"
@@ -670,6 +672,7 @@ class TestAscendFusedMoE:
         assert apply_kwargs["router_logits"] is prepared_logits
         assert apply_kwargs["num_experts"] == 4
         assert apply_kwargs["enable_force_load_balance"] is True
+        assert apply_kwargs["routed_scaling_factor"] == 1.0
         assert torch.equal(apply_kwargs["mc2_mask"], prepare_output.mc2_mask)
         torch.testing.assert_close(layer.moe_load, torch.tensor([2, 3]))
         if return_with_event:
@@ -733,6 +736,16 @@ class TestAscendFusedMoE:
 
 
 class TestAscendFusedMoESharedExperts:
+    def test_nongated_moe_constructor_guard_is_temporarily_bypassed(self, monkeypatch):
+        import vllm.model_executor.layers.fused_moe.layer as vllm_moe_layer
+
+        monkeypatch.setattr(vllm_moe_layer.current_platform, "is_cuda_alike", lambda: False)
+
+        assert not vllm_moe_layer.current_platform.is_cuda_alike()
+        with _allow_nongated_moe_constructor_on_ascend():
+            assert vllm_moe_layer.current_platform.is_cuda_alike()
+        assert not vllm_moe_layer.current_platform.is_cuda_alike()
+
     def test_properties_and_forward_delegate(self, monkeypatch):
         layer = AscendFusedMoE.__new__(AscendFusedMoE)
         if not hasattr(type(layer), "gate"):
@@ -775,6 +788,20 @@ class TestAscendFusedMoESharedExperts:
         torch.testing.assert_close(part1_out, gate_up)
         torch.testing.assert_close(part2_out, F.sigmoid(gate_out) * down_out)
 
+    def test_shared_experts_split_supports_up_proj_without_gate_up_proj(self):
+        layer = AscendFusedMoE.__new__(AscendFusedMoE)
+        if not hasattr(layer, "_shared_experts_part1"):
+            pytest.skip("Current AscendFusedMoE does not split shared experts")
+        hidden_states = torch.tensor([[1.0, -1.0]])
+        up_out = torch.tensor([[2.0, -2.0]])
+        shared_experts = SimpleNamespace(up_proj=MagicMock(return_value=(up_out, None)))
+        layer._shared_experts = shared_experts
+
+        part1_out = layer._shared_experts_part1(hidden_states)
+
+        torch.testing.assert_close(part1_out, up_out)
+        shared_experts.up_proj.assert_called_once_with(hidden_states)
+
     @pytest.mark.parametrize("has_shared_experts", [False, True])
     def test_shared_forward_impl_routes_shared_output(self, monkeypatch, has_shared_experts):
         layer = AscendFusedMoE.__new__(AscendFusedMoE)
@@ -785,6 +812,7 @@ class TestAscendFusedMoESharedExperts:
         layer.use_overlapped = False
         layer._shared_experts = MagicMock() if has_shared_experts else None
         hidden_states = torch.randn(2, 4)
+        shared_input = torch.randn(2, 6)
         router_logits = torch.randn(2, 3)
         fused_result = fused_moe_module.FusedMoEResult(
             routed_out=torch.ones(2, 4),
@@ -799,10 +827,11 @@ class TestAscendFusedMoESharedExperts:
         monkeypatch.setattr(fused_moe_module.AscendFusedMoE, "forward_impl", MagicMock(return_value=fused_result))
         layer._forward_shared_experts = MagicMock(return_value="shared_out")
 
-        result = layer.shared_forward_impl(hidden_states, router_logits)
+        result = layer.shared_forward_impl(hidden_states, router_logits, shared_input)
 
         if has_shared_experts:
             assert result == ("shared_out", fused_result.routed_out)
             layer._forward_shared_experts.assert_called_once()
+            assert layer._forward_shared_experts.call_args.args[0] is shared_input
         else:
             torch.testing.assert_close(result, fused_result.routed_out)

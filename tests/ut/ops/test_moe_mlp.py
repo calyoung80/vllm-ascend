@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp
+from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp, unquant_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -63,6 +63,27 @@ class TestW4A8RuntimeFlags(unittest.TestCase):
 
 
 class TestUnifiedApplyMlpRequest(unittest.TestCase):
+    def test_unquant_apply_mlp_supports_relu2_no_mul(self):
+        gate_up = torch.tensor([[-1.0, 2.0], [3.0, -4.0]])
+        expected_act = torch.tensor([[0.0, 4.0], [9.0, 0.0]])
+        expected_out = torch.ones_like(gate_up)
+
+        with patch("vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_grouped_matmul", create=True) as mock_gmm:
+            mock_gmm.side_effect = [[gate_up], [expected_out]]
+
+            output, event = unquant_apply_mlp(
+                hidden_states=torch.randn(2, 2),
+                w1=torch.randn(1, 2, 2),
+                w2=torch.randn(1, 2, 2),
+                group_list=torch.tensor([2], dtype=torch.int64),
+                activation="relu2_no_mul",
+                need_trans=False,
+            )
+
+        self.assertIsNone(event)
+        torch.testing.assert_close(output, expected_out)
+        torch.testing.assert_close(mock_gmm.call_args_list[1].kwargs["x"][0], expected_act)
+
     def test_request_unquant_path(self):
         hidden_states = torch.randn(2, 8)
         expected = torch.randn(2, 8)

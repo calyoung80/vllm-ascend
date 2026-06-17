@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 
@@ -87,6 +88,21 @@ def mock_false():
 
 def mock_true():
     return True
+
+
+@contextmanager
+def _allow_nongated_moe_constructor_on_ascend():
+    # vLLM currently gates non-gated MoE construction to CUDA/XPU.
+    # Ascend supplies its own FusedMoE forward path, so bypass only this
+    # constructor capability check until vLLM exposes a backend hook.
+    import vllm.model_executor.layers.fused_moe.layer as vllm_moe_layer
+
+    original_is_cuda_alike = vllm_moe_layer.current_platform.is_cuda_alike
+    vllm_moe_layer.current_platform.is_cuda_alike = lambda: True
+    try:
+        yield
+    finally:
+        vllm_moe_layer.current_platform.is_cuda_alike = original_is_cuda_alike
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -312,7 +328,7 @@ class AscendMoERunner(MoERunner):
             # Otherwise, it returns just routed_out
             # The torch op expects the same return type based on whether it's moe_forward or moe_forward_shared
         else:
-            result = layer.shared_forward_impl(hidden_states, router_logits)
+            result = layer.shared_forward_impl(hidden_states, router_logits, shared_input)
         return result
 
     def _forward_impl(
@@ -345,9 +361,14 @@ class AscendFusedMoE(FusedMoE):
         tid2eid = kwargs.pop("tid2eid") if "tid2eid" in kwargs else None
 
         self._original_routed_scaling_factor = kwargs.get("routed_scaling_factor", 1.0)
-        super().__init__(*args, **kwargs)
+        if kwargs.get("is_act_and_mul", True):
+            super().__init__(*args, **kwargs)
+        else:
+            with _allow_nongated_moe_constructor_on_ascend():
+                super().__init__(*args, **kwargs)
         self.use_overlapped = True
         self._routed_input_transform = kwargs.get("routed_input_transform")
+        self._routed_output_transform = kwargs.get("routed_output_transform")
         self._shared_experts = kwargs.get("shared_experts")
         self.shared_expert_stream = None
         has_shared_experts = self._shared_experts is not None
@@ -476,6 +497,8 @@ class AscendFusedMoE(FusedMoE):
             kwargs.pop("shared_experts", None),
             self.quant_method,
             self.vllm_config.parallel_config.enable_dbo,
+            routed_output_transform=self._routed_output_transform,
+            routed_scaling_factor=self._original_routed_scaling_factor,
         )
 
         if self.multistream_overlap_shared_expert:
@@ -527,7 +550,11 @@ class AscendFusedMoE(FusedMoE):
         )
 
     def _shared_experts_part1(self, hidden_states: torch.Tensor):
-        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
+        assert self._shared_experts is not None
+        shared_up_proj = getattr(self._shared_experts, "gate_up_proj", None)
+        if shared_up_proj is None:
+            shared_up_proj = getattr(self._shared_experts, "up_proj")
+        shared_gate_up, _ = shared_up_proj(hidden_states)  # type: ignore
         return shared_gate_up
 
     def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
@@ -624,7 +651,12 @@ class AscendFusedMoE(FusedMoE):
             with npu_stream_switch(AscendFusedMoE.gate_stream, enabled=self.multistream_overlap_gate):
                 # share_expert
                 assert fc3_context.shared_experts is not None
-                shared_out = fc3_context.shared_experts(hidden_states)
+                shared_experts_input = (
+                    fc3_context.shared_experts_input
+                    if fc3_context.shared_experts_input is not None
+                    else hidden_states
+                )
+                shared_out = fc3_context.shared_experts(shared_experts_input)
                 # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
                 moe_comm_type = _EXTRA_CTX.moe_comm_type
                 if (
@@ -644,7 +676,7 @@ class AscendFusedMoE(FusedMoE):
                     num_expert_group=self.num_expert_group,
                     custom_routing_function=self.custom_routing_function,
                     scoring_func=self.scoring_func,
-                    routed_scaling_factor=self._original_routed_scaling_factor,
+                    routed_scaling_factor=self.routed_scaling_factor,
                     e_score_correction_bias=self.e_score_correction_bias,
                     num_experts=self.moe_config.num_experts,
                     input_ids=input_ids,
@@ -689,7 +721,7 @@ class AscendFusedMoE(FusedMoE):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
-            routed_scaling_factor=self._original_routed_scaling_factor,
+            routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
@@ -747,8 +779,13 @@ class AscendFusedMoE(FusedMoE):
 
         with npu_stream_switch(shared_experts_calculation_stream(), enabled=self.multistream_overlap_shared_expert):
             # Only used for int quantization
-            has_quantized_shared = hasattr(self._shared_experts.gate_up_proj, "weight_scale") and hasattr(
-                self._shared_experts.down_proj, "weight_scale"
+            shared_up_proj = getattr(self._shared_experts, "gate_up_proj", None)
+            if shared_up_proj is None:
+                shared_up_proj = getattr(self._shared_experts, "up_proj", None)
+            has_quantized_shared = (
+                shared_up_proj is not None
+                and hasattr(shared_up_proj, "weight_scale")
+                and hasattr(self._shared_experts.down_proj, "weight_scale")
             )
             if has_quantized_shared and self.quant_type in (QuantType.W8A8, QuantType.W4A8):
                 original_dtype = hidden_states.dtype
@@ -760,8 +797,8 @@ class AscendFusedMoE(FusedMoE):
                 maybe_wait_event(fused_moe_evts.after_routed_experts)
                 hidden_states = torch_npu.npu_quant_matmul(
                     quantized_x,
-                    self._shared_experts.gate_up_proj.weight,
-                    self._shared_experts.gate_up_proj.weight_scale,
+                    shared_up_proj.weight,
+                    shared_up_proj.weight_scale,
                     pertoken_scale=None,
                     bias=None,
                     output_dtype=torch.int32,
@@ -771,7 +808,7 @@ class AscendFusedMoE(FusedMoE):
                 maybe_wait_event(fused_moe_evts.before_gmm2)
                 quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
                     x=hidden_states,
-                    weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
+                    weight_scale=shared_up_proj.weight_scale_fp32,
                     activation_scale=pertoken_scale,
                     bias=None,
                     quant_scale=None,
@@ -803,7 +840,7 @@ class AscendFusedMoE(FusedMoE):
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.before_dispatch)
-                hidden_states = self._shared_experts.gate_up_proj((quantized_x, pertoken_scale))[0]
+                hidden_states = shared_up_proj((quantized_x, pertoken_scale))[0]
                 # Execute activation concurrently with gmm2.
                 maybe_wait_event(fused_moe_evts.before_gmm2)
                 quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
@@ -846,10 +883,17 @@ class AscendFusedMoE(FusedMoE):
         return shared_out
 
     def shared_forward_impl(  # type: ignore[override]
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None = None,
     ):
+        shared_experts_input = shared_experts_input if shared_experts_input is not None else hidden_states
         if self.shared_multistream_overlap_gate:
-            set_flash_common3_context(shared_experts=self._shared_experts)
+            set_flash_common3_context(
+                shared_experts=self._shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
 
         if self.is_internal_router:
             gate = self.gate
@@ -858,7 +902,7 @@ class AscendFusedMoE(FusedMoE):
             # increase with extra hidden states. We also assume that all gate
             # linear is unquantized so that we the weight is pre-casted in
             # process_weights_after_loading of AscendUnquantizedLinearMethod.
-            hidden_states_fp32 = hidden_states.float()
+            hidden_states_fp32 = shared_experts_input.float()
             before_routed_experts = torch.npu.current_stream().record_event()
             router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
             after_routed_experts = torch.npu.current_stream().record_event()
@@ -882,7 +926,7 @@ class AscendFusedMoE(FusedMoE):
             shared_out = fc3_context.shared_out
         else:
             shared_out = self._forward_shared_experts(
-                hidden_states,
+                shared_experts_input,
                 FusedMoEEvents(
                     after_routed_experts=after_routed_experts,
                     before_routed_experts=before_routed_experts,

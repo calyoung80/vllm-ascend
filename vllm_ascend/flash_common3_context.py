@@ -11,6 +11,7 @@ class FlashCommon3Context:
     topk_ids: torch.Tensor | None = None
     row_idx: torch.Tensor | None = None
     shared_experts: torch.nn.Module | None = None
+    shared_experts_input: torch.Tensor | None = None
     shared_out: torch.Tensor | None = None
 
 
@@ -25,6 +26,7 @@ def set_flash_common3_context(
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     shared_experts: torch.nn.Module | None = None,
+    shared_experts_input: torch.Tensor | None = None,
     shared_out: torch.Tensor | None = None,
 ):
     global _flash_common3_context
@@ -37,5 +39,7 @@ def set_flash_common3_context(
         _flash_common3_context.topk_ids = topk_ids
     if shared_experts is not None:
         _flash_common3_context.shared_experts = shared_experts
+    if shared_experts_input is not None:
+        _flash_common3_context.shared_experts_input = shared_experts_input
     if shared_out is not None:
         _flash_common3_context.shared_out = shared_out

@@ -17,6 +17,7 @@
 
 import torch
 import torch_npu
+from torch.nn import functional as F
 from torch.nn.functional import pad
 from vllm.triton_utils import HAS_TRITON
 
@@ -36,6 +37,10 @@ from vllm_ascend.utils import (
 )
 
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
+
+SILU_NO_MUL = "silu_no_mul"
+GELU_NO_MUL = "gelu_no_mul"
+RELU2_NO_MUL = "relu2_no_mul"
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -381,6 +386,12 @@ def unquant_apply_mlp(
     if act_name == "swigluoai":
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
+    elif act_name == SILU_NO_MUL:
+        gate_up_out = F.silu(gate_up_out)
+    elif act_name == GELU_NO_MUL:
+        gate_up_out = F.gelu(gate_up_out)
+    elif act_name == RELU2_NO_MUL:
+        gate_up_out = torch.square(F.relu(gate_up_out))
     else:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
