@@ -32,6 +32,15 @@ def test_chunk_scan_dummy_optional_kernel_args_are_non_null():
     assert actual.dtype == reference.dtype
 
 
+def test_chunk_scan_initial_states_dummy_reuses_states_pointer():
+    states = torch.empty(2, 3, 4, 5)
+
+    actual = patch_triton._chunk_scan_initial_states_kernel_arg(states, None)
+
+    assert actual is states
+    assert actual.data_ptr() == states.data_ptr()
+
+
 def test_chunk_scan_patch_updates_combined_import_binding():
     assert ssd_chunk_scan._chunk_scan_fwd is patch_triton._chunk_scan_fwd_npu
     assert ssd_combined._chunk_scan_fwd is patch_triton._chunk_scan_fwd_npu

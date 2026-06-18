@@ -25,6 +25,12 @@ def _chunk_scan_optional_kernel_args(reference, optional_tensor, shape):
     return reference.new_empty(shape)
 
 
+def _chunk_scan_initial_states_kernel_arg(states, initial_states):
+    if initial_states is not None:
+        return initial_states
+    return states
+
+
 def _chunk_scan_fwd_npu(
     cb,
     x,
@@ -84,9 +90,12 @@ def _chunk_scan_fwd_npu(
 
     # Triton-Ascend may type-check pointers in constexpr-false branches. Keep
     # semantic flags false, but pass non-null tensors for optional pointers.
+    # The initstates branch selects between initstates_ptr and states_ptr, so
+    # the dummy pointer must share the states base to satisfy pointer-source
+    # checks even when HAS_INITSTATES is false.
     z_ptr = _chunk_scan_optional_kernel_args(x, z, (1, 1, 1))
     D_ptr = _chunk_scan_optional_kernel_args(x, D, (1,))
-    initstates_ptr = _chunk_scan_optional_kernel_args(states, None, (1, 1, 1, 1))
+    initstates_ptr = _chunk_scan_initial_states_kernel_arg(states, initial_states)
 
     _ssd_chunk_scan._chunk_scan_fwd_kernel[grid](
         cb_ptr=cb,
