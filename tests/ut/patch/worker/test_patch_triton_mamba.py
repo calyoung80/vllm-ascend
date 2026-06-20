@@ -19,7 +19,39 @@ import torch
 import vllm.model_executor.layers.mamba.ops.ssd_chunk_scan as ssd_chunk_scan
 import vllm.model_executor.layers.mamba.ops.ssd_combined as ssd_combined
 
+import vllm_ascend.ops.triton.mamba.ssd_chunk_scan as ascend_ssd_chunk_scan
 from vllm_ascend.patch.worker import patch_triton
+
+
+def _contiguous_strides(shape):
+    stride = 1
+    strides = []
+    for dim in reversed(shape):
+        strides.append(stride)
+        stride *= dim
+    return tuple(reversed(strides))
+
+
+class _FakeNPUTensor:
+
+    class _Device:
+        type = "npu"
+        index = 0
+
+    def __init__(self, shape):
+        self.shape = shape
+        self.device = self._Device()
+        self.dtype = torch.float16
+        self._strides = _contiguous_strides(shape)
+
+    def stride(self, dim):
+        return self._strides[dim]
+
+    def dim(self):
+        return len(self.shape)
+
+    def new_empty(self, shape):
+        return _FakeNPUTensor(shape)
 
 
 def test_chunk_scan_dummy_optional_kernel_args_are_non_null():
@@ -39,6 +71,134 @@ def test_chunk_scan_initial_states_dummy_reuses_states_pointer():
 
     assert actual is states
     assert actual.data_ptr() == states.data_ptr()
+
+
+def test_chunk_scan_initial_states_arg_uses_real_tensor():
+    states = torch.empty(2, 3, 4, 5)
+    initial_states = torch.empty(6, 3, 4, 5)
+
+    actual = patch_triton._chunk_scan_initial_states_kernel_arg(states, initial_states)
+
+    assert actual is initial_states
+
+
+def test_chunk_scan_initial_states_strides():
+    initial_states = torch.empty(6, 3, 4, 5)
+
+    actual = patch_triton._chunk_scan_initial_states_strides(initial_states)
+
+    assert actual == initial_states.stride()
+
+
+def test_chunk_scan_npu_without_initial_states_uses_upstream_kernel(monkeypatch):
+    captured = {}
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+            return self
+
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        ascend_ssd_chunk_scan._ssd_chunk_scan,
+        "_chunk_scan_fwd_kernel",
+        FakeKernel(),
+    )
+
+    seqlen = 16
+    nheads = 2
+    headdim = 4
+    ngroups = 1
+    dstate = 8
+    nchunks = 2
+    chunk_size = 8
+
+    cb = _FakeNPUTensor((nchunks, ngroups, chunk_size, chunk_size))
+    x = _FakeNPUTensor((seqlen, nheads, headdim))
+    dt = _FakeNPUTensor((nheads, nchunks, chunk_size))
+    dA_cumsum = _FakeNPUTensor((nheads, nchunks, chunk_size))
+    C = _FakeNPUTensor((seqlen, ngroups, dstate))
+    states = _FakeNPUTensor((nchunks, nheads, headdim, dstate))
+    cu_chunk_seqlens = _FakeNPUTensor((nchunks + 1,))
+    out = _FakeNPUTensor((seqlen, nheads, headdim))
+    seq_idx = _FakeNPUTensor((nchunks,))
+
+    ascend_ssd_chunk_scan._chunk_scan_fwd_npu(
+        cb,
+        x,
+        dt,
+        dA_cumsum,
+        C,
+        states,
+        cu_chunk_seqlens,
+        out,
+        seq_idx,
+    )
+
+    assert captured["HAS_INITSTATES"] is False
+    assert captured["initstates_ptr"] is states
+    assert captured["stride_init_states_batch"] == 0
+    assert captured["stride_init_states_head"] == 0
+    assert captured["stride_init_states_hdim"] == 0
+    assert captured["stride_init_states_dstate"] == 0
+
+
+def test_chunk_scan_npu_initial_states_uses_ascend_kernel(monkeypatch):
+    captured = {}
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+            return self
+
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(ascend_ssd_chunk_scan, "_chunk_scan_fwd_kernel_npu", FakeKernel())
+
+    seqlen = 16
+    nheads = 2
+    headdim = 4
+    ngroups = 1
+    dstate = 8
+    nchunks = 2
+    chunk_size = 8
+    batch = 2
+
+    cb = _FakeNPUTensor((nchunks, ngroups, chunk_size, chunk_size))
+    x = _FakeNPUTensor((seqlen, nheads, headdim))
+    dt = _FakeNPUTensor((nheads, nchunks, chunk_size))
+    dA_cumsum = _FakeNPUTensor((nheads, nchunks, chunk_size))
+    C = _FakeNPUTensor((seqlen, ngroups, dstate))
+    states = _FakeNPUTensor((nchunks, nheads, headdim, dstate))
+    cu_chunk_seqlens = _FakeNPUTensor((nchunks + 1,))
+    out = _FakeNPUTensor((seqlen, nheads, headdim))
+    seq_idx = _FakeNPUTensor((nchunks,))
+    initial_states = _FakeNPUTensor((batch, nheads, headdim, dstate))
+
+    ascend_ssd_chunk_scan._chunk_scan_fwd_npu(
+        cb,
+        x,
+        dt,
+        dA_cumsum,
+        C,
+        states,
+        cu_chunk_seqlens,
+        out,
+        seq_idx,
+        initial_states=initial_states,
+    )
+
+    assert captured["HAS_INITSTATES"] is True
+    assert captured["initstates_ptr"] is initial_states
+    assert captured["stride_init_states_batch"] == initial_states.stride(0)
+    assert captured["stride_init_states_head"] == initial_states.stride(1)
+    assert captured["stride_init_states_hdim"] == initial_states.stride(2)
+    assert captured["stride_init_states_dstate"] == initial_states.stride(3)
 
 
 def test_chunk_scan_patch_updates_combined_import_binding():
