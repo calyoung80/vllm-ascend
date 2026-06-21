@@ -19,6 +19,7 @@ Qwen3-VL-Reranker.md
 Qwen3-8B-W4A8.md
 Qwen3-32B-W4A4.md
 Qwen3-Next.md
+NVIDIA-Nemotron-3-Super-120B-A12B-BF16.md
 Qwen3-Omni-30B-A3B-Thinking.md
 Qwen3.5-27B.md
 Qwen3.5-397B-A17B.md
