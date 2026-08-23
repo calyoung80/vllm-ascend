@@ -176,12 +176,14 @@ class AscendExtractHiddenStatesProposer(ExtractHiddenStatesProposer):
         device = sampled_token_ids.device
 
         # Compute backup tokens for discarded / invalid requests
-        seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
-        backup_tokens = torch.tensor(
-            [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)],
-            dtype=torch.int32,
-            device=device,
-        )
+        # Use CpuGpuBuffer (upstream pattern) instead of torch.tensor([...], device=device)
+        # which triggers aivec error on 2nd request on Ascend NPU
+        for i in range(num_reqs):
+            self.backup_next_token_ids.np[i] = requests[
+                gpu_input_batch.req_ids[i]
+            ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
+        self.backup_next_token_ids.copy_to_gpu(num_reqs)
+        backup_tokens = self.backup_next_token_ids.gpu[:num_reqs]
 
         # Create discard mask from indices (Ascend uses indices/count pattern)
         discard_mask = torch.zeros(num_reqs, dtype=torch.bool, device=device)
