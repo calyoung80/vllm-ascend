@@ -73,10 +73,6 @@ def _make_config():
             num_gpu_blocks_override=None,
             mamba_cache_mode="none",
             enable_prefix_caching=False,
-            get_resolved_kv_cache_layout=lambda: SimpleNamespace(
-                is_layer_compact=True,
-                is_block_compact=True,
-            ),
         ),
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -145,7 +141,7 @@ def _make_runner(config, main_cache_dims=(4, 0)):
     runner.kernel_block_sizes = [[8], [2], [0]]
     # The runner gates GLM-Next reshape views on the spec-carried
     # model_version marker, not on model_config.
-    runner.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm5_next"))
+    runner.model_config = SimpleNamespace()
 
     specs = _make_specs()
     attn_groups = [

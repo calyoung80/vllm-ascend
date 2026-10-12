@@ -14,12 +14,6 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import NPUPlatform
 
 
-def _non_ssm_backend_patch():
-    if utils.vllm_version_is("0.30.0"):
-        return patch.object(NPUPlatform, "_find_non_ssm_backend", return_value=AscendAttentionBackend)
-    return patch.object(NPUPlatform, "_find_non_ssm_backends", return_value=[AscendAttentionBackend])
-
-
 def make_config(architecture, dtype):
     model = MagicMock()
     model.hf_config.architectures = [architecture]
@@ -58,7 +52,7 @@ def test_m3_fp8_keeps_upstream_alignment_at_128(architecture, dtype, user_specif
         ),
         patch("vllm_ascend.attention.attention_v1.get_current_vllm_config_or_none", return_value=config),
         patch("vllm.config.vllm.set_current_vllm_config", return_value=nullcontext()),
-        _non_ssm_backend_patch(),
+        patch.object(NPUPlatform, "_find_non_ssm_backend", return_value=AscendAttentionBackend),
     ):
         utils.refresh_block_size(config)
         # The runner snapshots this size before model loading. Keep it at the
@@ -109,7 +103,7 @@ def test_without_skip_layers_keeps_128_for_indexer():
         ),
         patch("vllm_ascend.attention.attention_v1.get_current_vllm_config_or_none", return_value=config),
         patch("vllm.config.vllm.set_current_vllm_config", return_value=nullcontext()),
-        _non_ssm_backend_patch(),
+        patch.object(NPUPlatform, "_find_non_ssm_backend", return_value=AscendAttentionBackend),
     ):
         NPUPlatform.update_block_size_for_backend(config)
         assert AscendAttentionBackend.get_supported_kernel_block_sizes() == [128]

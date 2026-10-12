@@ -79,20 +79,18 @@ class _FakeBlockPool:
 class _FakeFAManager:
     def __init__(self, **kwargs):
         self.use_eagle = False
-        self.block_size = kwargs["kv_cache_spec"].block_size
 
 
 class _FakeMambaManager:
     def __init__(self, **kwargs):
         self.use_eagle = False
-        self.block_size = kwargs["kv_cache_spec"].block_size
 
 
 def _fake_manager_factory(**kwargs):
     spec = kwargs["kv_cache_spec"]
     if isinstance(spec, MambaSpec):
-        return _FakeMambaManager(**kwargs)
-    return _FakeFAManager(**kwargs)
+        return _FakeMambaManager()
+    return _FakeFAManager()
 
 
 def _hybrid_config(*, mamba_eagle: bool = False) -> KVCacheConfig:
