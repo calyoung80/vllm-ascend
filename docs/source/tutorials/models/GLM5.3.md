@@ -404,7 +404,9 @@ This scenario enables `additional_config.enable_fused_mc2=1` (fused `dispatch_ff
 This A3 reference serves GLM-5.3 W8A8C8 with a **200,000-token** maximum
 sequence length for the 198K workload. It uses one Prefill engine spanning
 P0/P1 with TP16 and PP2, and sixteen TP2 Decode engines on D0/D1.
-Section 5.1.3 adds MemCache KV pooling to the same deployment.
+Prefill-Decode disaggregation is also supported on A2; use an A2-sized
+topology and parameters for its available devices. Section 5.1.3 adds
+MemCache KV pooling to the same deployment.
 
 ##### 5.1.2.1 Topology and Prerequisites
 
@@ -912,10 +914,12 @@ Key parameters:
 
 #### 5.1.3 MemCache KV Cache Pool Deployment
 
-This extends the same four-node PP/PD topology with `MultiConnector`:
-`MooncakeConnectorV2` transfers KV cache from Prefill to Decode, and
-`AscendStoreConnector` provides non-layerwise MemCache pooling. Retain
-the launcher, PP placement, and proxy routing from Section 5.1.2.
+This A3 reference extends the same four-node PP/PD topology with
+`MultiConnector`: `MooncakeConnectorV2` transfers KV cache from Prefill to
+Decode, and `AscendStoreConnector` provides non-layerwise MemCache pooling.
+MemCache KV pooling is also supported on A2, using an A2-sized topology and
+parameters. Retain the launcher, PP placement, and proxy routing from
+Section 5.1.2 for this A3 reference.
 
 ##### 5.1.3.1 Prepare MemCache
 
@@ -1445,9 +1449,9 @@ than one cache block and repeat requests with the same prefix. Inspect
 Ascend Store/MemCache saves, lookups, loads, and hit metrics. A successful
 response or a local prefix-cache hit alone does not demonstrate shared pool
 reuse; verify a pool load when the prefix is absent from the engine's local
-cache.  These references do not
-establish A2, 1M-context, or other parallel-layout support, and do not add
-accuracy or performance claims for the 198K workload.
+cache. These A3 reference scripts do not prescribe the A2 resource layout,
+the 1M-context topology, or other parallel layouts, and do not add accuracy
+or performance claims for the 198K workload.
 
 ### 5.2 1M Context Configuration
 
