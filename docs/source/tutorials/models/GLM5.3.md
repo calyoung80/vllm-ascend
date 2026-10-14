@@ -1304,8 +1304,8 @@ Key parameters:
 This A3 reference extends the same four-node PP/PD topology with
 `MultiConnector`: `MooncakeConnectorV2` transfers KV cache from Prefill to
 Decode, and `AscendStoreConnector` provides non-layerwise MemCache pooling.
-The dedicated eight-node A2 pooling reference is in Section 5.3. Retain the
-launcher, PP placement, and proxy routing from Section 5.1.2 for this A3
+The dedicated eight-node A2 pooling reference is in Section 5.1.3.5. Retain
+the launcher, PP placement, and proxy routing from Section 5.1.2 for this A3
 reference.
 
 ##### 5.1.3.1 Prepare MemCache
@@ -1837,8 +1837,440 @@ Ascend Store/MemCache saves, lookups, loads, and hit metrics. A successful
 response or a local prefix-cache hit alone does not demonstrate shared pool
 reuse; verify a pool load when the prefix is absent from the engine's local
 cache. The A3 reference scripts above and the A2 scripts in Sections 5.1.2.5
-and 5.3 use different topologies and are not interchangeable. These references
-do not add accuracy or performance claims for the 198K workload.
+and 5.1.3.5 use different topologies and are not interchangeable. These
+references do not add accuracy or performance claims for the 198K workload.
+
+##### 5.1.3.5 A2 Series: 8-Node Deployment with MemCache KV Cache Pool
+
+This section adds MemCache KV-cache pooling to an 8-node A2
+prefill-decode deployment of GLM-5.3 W8A8C8 on vLLM v0.30.0. It uses the
+same connector pattern as the A3 pooling reference above: `MultiConnector`
+combines `MooncakeConnectorV2`
+for prefill-to-decode KV transfer with `AscendStoreConnector` for
+non-layerwise MemCache pooling. The pool lets repeated or shared
+prefixes be served from pooled DRAM instead of re-running prefill, which
+is what moves high-repetition workloads from cold-path to warm-path
+TTFT.
+
+!!! warning
+
+    This reference uses a different Prefill topology than Section 5.1.2.5:
+    here each Prefill instance is TP8 × PP2 spanning two nodes, and two
+    such instances run as two separate API servers. The pooled scripts
+    were validated only in this topology — do not combine them with the
+    Section 5.1.2.5 parallel layout.
+
+| Role | Nodes | Parallelism | Placement | Devices per role |
+| --- | --- | --- | --- | --- |
+| Prefill | 4 nodes (2 instances) | TP8 × PP2 per instance | One PP stage per node; instance 0 on nodes 0+1, instance 1 on nodes 2+3 | 32 |
+| Decode | 4 nodes | DP16 × TP2 | Four DP ranks per node (ranks 0-3, 4-7, 8-11, 12-15) | 32 |
+
+Each Prefill instance exposes one API server (ports 8000 on both
+instance leaders); the proxy registers both. Decode keeps the Section
+5.3 arrangement: one 2-device engine per DP rank, coordinated by the
+`launch_online_dp.py` launcher from Section 5.1.2.5.1 (reused unchanged),
+DP RPC master on `<DECODE_NODE0_IP>`:12990, API ports 10010-10013.
+
+###### 5.1.3.5.1 Prepare MemCache
+
+Complete [MemCache backend setup](../../user_guide/feature_guide/kv_cache_pool_ascend_store.md#scenario-2-memcache-backend),
+including the `memfabric-hybrid` and `memcache-hybrid` installation and
+the hardware prerequisites. Connector arguments do not start the
+MemCache service; all Prefill and Decode nodes must reach the same
+MetaService.
+
+1. Install on every node:
+
+    ```shell
+    pip install memfabric-hybrid
+    pip install memcache-hybrid
+    ```
+
+2. Prepare `mmc-meta.conf` (used by the MetaService on one node, here
+   `<MEMCACHE_META_IP>`):
+
+    ```ini
+    ock.mmc.meta_service_url = tcp://<MEMCACHE_META_IP>:5000
+    ock.mmc.meta_service.config_store_url = tcp://<MEMCACHE_META_IP>:6000
+    ock.mmc.meta_service.metrics_url = http://<MEMCACHE_META_IP>:8009
+    ock.mmc.log_level = info
+    ```
+
+3. Prepare `mmc-local.conf` in shared storage (or a copy on each node
+   with identical contents), referenced later by `MMC_LOCAL_CONFIG_PATH`.
+   `world_size` must cover every LocalService across both roles (here
+   256 with headroom); `device_rdma` is the A2/RoCE protocol; the pool
+   size is `dram.size` per die across all connected ranks. This reference
+   reserves `40GB` for each LocalService.
+
+    ```ini
+    ock.mmc.meta_service_url = tcp://<MEMCACHE_META_IP>:5000
+    ock.mmc.local_service.config_store_url = tcp://<MEMCACHE_META_IP>:6000
+    ock.mmc.log_level = error
+    ock.mmc.local_service.world_size = 256
+    ock.mmc.local_service.protocol = device_rdma
+    ock.mmc.local_service.dram.size = 40GB
+    ```
+
+4. Set `MEMCACHE_ROOT` to the installed `memcache_hybrid` directory and
+   `PYTHON_LIB_DIR` to the library directory of the Python installation
+   actually used by vLLM on each node (both are used by the scripts
+   below).
+
+###### 5.1.3.5.2 Prefill Engine Script (Pooled)
+
+Save the following script as `start_p_pool.sh` on all four Prefill nodes. Each instance spans
+two nodes (`--nnodes 2`, `mp` backend): the instance leader runs
+`node_rank 0` and hosts the API server; its partner runs `node_rank 1`.
+Run it once per node with the node's role.
+
+```shell
+#!/usr/bin/env bash
+set -euo pipefail
+
+NODE_RANK=${1:?"need node_rank (0=instance leader, 1=partner)"}
+PORT=${2:-8000}
+LOCAL_IP=${3:?need local_ip}
+INSTANCE_LEADER_IP=${4:?need instance_leader_ip}
+INSTANCE_ID=${5:?need instance_id}
+
+case "$NODE_RANK" in
+  0) HEADLESS_ARGS="";;                  # instance leader: API server
+  1) HEADLESS_ARGS="--headless";;        # partner node: second PP stage
+  *) echo "node_rank must be 0 or 1" >&2; exit 1;;
+esac
+
+MODEL_PATH=${MODEL_PATH:-/path/to/GLM-5.3-w8a8c8}
+NIC_NAME=${NIC_NAME:?"export NIC_NAME to this node's business interface"}
+MEMCACHE_ROOT=${MEMCACHE_ROOT:?export MEMCACHE_ROOT to the memcache_hybrid install dir}
+PYTHON_LIB_DIR=${PYTHON_LIB_DIR:?export PYTHON_LIB_DIR to the vLLM Python lib dir}
+# Instance leader address: nodes 0+1 form instance 0 (leader = <PREFILL_NODE0_IP>),
+# nodes 2+3 form instance 1 (leader = <PREFILL_NODE2_IP>).
+
+unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+
+export VLLM_SERVER_DEV_MODE=1
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
+export HCCL_EXEC_TIMEOUT=1800
+export HCCL_CONNECT_TIMEOUT=1800
+# TP8 stays inside one node per PP stage, so HCCL_IF_IP to the business IP is fine here.
+export VLLM_HOST_IP=$LOCAL_IP
+export HCCL_IF_IP=$LOCAL_IP
+export GLOO_SOCKET_IFNAME=$NIC_NAME
+export TP_SOCKET_IFNAME=$NIC_NAME
+export HCCL_SOCKET_IFNAME=$NIC_NAME
+export LD_LIBRARY_PATH="${PYTHON_LIB_DIR}:/usr/local/lib:${LD_LIBRARY_PATH}"
+export HCCL_BUFFSIZE=1024
+export HCCL_OP_EXPANSION_MODE=AIV
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export VLLM_USE_FASTOKENS=1
+export VLLM_PP_LAYER_PARTITION="42,36"
+export PYTHONHASHSEED=0
+export ACL_OP_INIT_MODE=1
+export MMC_LOCAL_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-local.conf"
+export LD_LIBRARY_PATH="${MEMCACHE_ROOT}/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}"
+export ASCEND_LOCAL_COMM_RES='{"version":"1.2"}'
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+exec vllm serve "$MODEL_PATH" \
+  --host 0.0.0.0 \
+  --port "$PORT" \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --pipeline-parallel-size 2 \
+  --distributed-executor-backend mp \
+  --master-addr "$INSTANCE_LEADER_IP" \
+  --master-port 7060 \
+  --nnodes 2 \
+  --node-rank "$NODE_RANK" \
+  --enable-chunked-prefill \
+  --no-async-scheduling \
+  --enable-prefix-caching \
+  --seed 1024 \
+  --served-model-name glm5 \
+  --max-model-len 200000 \
+  --max-num-batched-tokens 16384 \
+  --max-num-seqs 64 \
+  --gpu-memory-utilization 0.92 \
+  --trust-remote-code \
+  --quantization ascend \
+  --safetensors-load-strategy prefetch \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm47 \
+  --enforce-eager \
+  --kv-cache-dtype int8 \
+  --attention_config.indexer_kv_dtype int8 \
+  --additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":true,"scheduler_config":{"profiling_chunk_config":{"enabled":true}}}' \
+  --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
+  --kv-transfer-config '{
+      "kv_connector": "MultiConnector",
+      "kv_role": "kv_producer",
+      "kv_port": "30000",
+      "engine_id": "glm53-a2-prefill-pool-'"$INSTANCE_ID"'",
+      "kv_connector_extra_config": {
+          "connectors": [
+          {
+              "kv_connector": "MooncakeConnectorV2",
+              "kv_role": "kv_producer",
+              "kv_port": "30000",
+              "kv_connector_extra_config": {
+                  "use_ascend_direct": true,
+                  "prefill": {"dp_size": 1, "pp_size": 2, "tp_size": 8, "pp_layer_partition": "42,36"},
+                  "decode": {"dp_size": 16, "tp_size": 2}
+              }
+          },
+          {
+              "kv_connector": "AscendStoreConnector",
+              "kv_role": "kv_producer",
+              "kv_connector_extra_config": {
+                  "lookup_rpc_port": "0",
+                  "backend": "memcache",
+                  "use_layerwise": false
+              }
+          }
+          ]
+      }
+   }' \
+  $HEADLESS_ARGS
+```
+
+The four Prefill start commands are grouped in Section 5.1.3.5.4. The two
+Prefill instances are fully independent vLLM deployments (each with its own
+TCP store on its leader's port 7060); they share only the weight directory,
+the MemCache pool, and the proxy in front of them.
+
+###### 5.1.3.5.3 Decode Engine Script (Pooled)
+
+Save the following complete script as `start_d_engine_pool.sh` on all
+four Decode nodes. Set `LOCAL_IP` to the current node's IP in each copy.
+`launch_online_dp.py` (Section 5.1.2.5.1) supplies `$1`-`$7`; the NIC, model,
+and MemCache paths are configured in this script.
+
+```shell
+#!/usr/bin/env bash
+set -euo pipefail
+
+VISIBLE_DEVICES=$1
+PORT=$2
+DP_SIZE=$3
+DP_RANK=$4
+DP_ADDRESS=$5
+DP_RPC_PORT=$6
+TP_SIZE=$7
+MODEL_PATH="<YOUR_MODEL_PATH>"
+
+LOCAL_IP="<CURRENT_DECODE_NODE_IP>"
+NIC_NAME="<NETWORK_INTERFACE>"
+MEMCACHE_ROOT="<MEMCACHE_ROOT>"
+PYTHON_LIB_DIR="<PYTHON_LIB_DIR>"
+
+unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+
+export VLLM_SERVER_DEV_MODE=1
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
+export HCCL_EXEC_TIMEOUT=1800
+export HCCL_CONNECT_TIMEOUT=1800
+export ASCEND_TRANSFER_TIMEOUT=10000
+# Intra-node TP2: HCCL_IF_IP to the local business IP is fine here.
+export VLLM_HOST_IP=$LOCAL_IP
+export HCCL_IF_IP=$LOCAL_IP
+export GLOO_SOCKET_IFNAME=$NIC_NAME
+export TP_SOCKET_IFNAME=$NIC_NAME
+export HCCL_SOCKET_IFNAME=$NIC_NAME
+export LD_LIBRARY_PATH="${PYTHON_LIB_DIR}:/usr/local/lib:${LD_LIBRARY_PATH}"
+export HCCL_BUFFSIZE=1024
+export HCCL_OP_EXPANSION_MODE=AIV
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1
+export VLLM_USE_V2_MODEL_RUNNER=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTHONHASHSEED=0
+export ACL_OP_INIT_MODE=1
+export MMC_LOCAL_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-local.conf"
+export LD_LIBRARY_PATH="${MEMCACHE_ROOT}/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}"
+export ASCEND_LOCAL_COMM_RES='{"version":"1.2"}'
+
+exec vllm serve "$MODEL_PATH" \
+  --host 0.0.0.0 \
+  --port "$PORT" \
+  --data-parallel-size "$DP_SIZE" \
+  --data-parallel-rank "$DP_RANK" \
+  --data-parallel-address "$DP_ADDRESS" \
+  --data-parallel-rpc-port "$DP_RPC_PORT" \
+  --tensor-parallel-size "$TP_SIZE" \
+  --enable-expert-parallel \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --seed 1024 \
+  --served-model-name glm5 \
+  --max-model-len 200000 \
+  --max-num-batched-tokens 256 \
+  --max-num-seqs 64 \
+  --gpu-memory-utilization 0.92 \
+  --async-scheduling \
+  --quantization ascend \
+  --safetensors-load-strategy prefetch \
+  --enable-auto-tool-choice \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm47 \
+  --kv-cache-dtype int8 \
+  --attention_config.indexer_kv_dtype int8 \
+  --additional-config '{"recompute_scheduler_enable":true}' \
+  --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+  --kv-transfer-config '{
+      "kv_connector": "MultiConnector",
+      "kv_role": "kv_consumer",
+      "kv_port": "30200",
+      "engine_id": "glm53-a2-decode-pool-dp'"$DP_RANK"'",
+      "kv_connector_extra_config": {
+          "connectors": [
+          {
+              "kv_connector": "MooncakeConnectorV2",
+              "kv_role": "kv_consumer",
+              "kv_port": "30200",
+              "kv_connector_extra_config": {
+                  "use_ascend_direct": true,
+                  "prefill": {"dp_size": 1, "pp_size": 2, "tp_size": 8, "pp_layer_partition": "42,36"},
+                  "decode": {"dp_size": 16, "tp_size": 2}
+              }
+          },
+          {
+              "kv_connector": "AscendStoreConnector",
+              "kv_role": "kv_consumer",
+              "kv_connector_extra_config": {
+                  "lookup_rpc_port": "0",
+                  "backend": "memcache",
+                  "use_layerwise": false
+              }
+          }
+          ]
+      }
+   }'
+```
+
+The four Decode start commands are grouped in Section 5.1.3.5.4. They use
+`--script ./start_d_engine_pool.sh` and the same launcher arguments as
+Section 5.1.2.5.4.
+
+###### 5.1.3.5.4 Start Services
+
+Start services in this order: MemCache MetaService, Prefill, Decode, then
+Proxy.
+
+1. Start the MemCache MetaService on `<MEMCACHE_META_IP>` before any vLLM
+   process:
+
+    ```shell
+    export MMC_META_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-meta.conf"
+    python3 -c "from memcache_hybrid import MetaService; MetaService.main()"
+    ```
+
+2. Start the two Prefill instances. Run each command on its target node and
+   export the shared paths and the instance leader IP on that node:
+
+    ```shell
+    # Prefill node 0: instance 0 leader and API server
+    export MODEL_PATH="<YOUR_MODEL_PATH>"
+    export NIC_NAME="<NETWORK_INTERFACE>"
+    export MEMCACHE_ROOT="<MEMCACHE_ROOT>"
+    export PYTHON_LIB_DIR="<PYTHON_LIB_DIR>"
+    bash start_p_pool.sh 0 8000 <PREFILL_NODE0_IP> <PREFILL_NODE0_IP> 0
+
+    # Prefill node 1: instance 0 partner
+    bash start_p_pool.sh 1 8000 <PREFILL_NODE1_IP> <PREFILL_NODE0_IP> 0
+
+    # Prefill node 2: instance 1 leader and API server
+    bash start_p_pool.sh 0 8000 <PREFILL_NODE2_IP> <PREFILL_NODE2_IP> 1
+
+    # Prefill node 3: instance 1 partner
+    bash start_p_pool.sh 1 8000 <PREFILL_NODE3_IP> <PREFILL_NODE2_IP> 1
+    ```
+
+3. After both Prefill instances are ready, start Decode on all four Decode
+    nodes. Run each command on its target node; `LOCAL_IP` is configured in
+    that node's copy of `start_d_engine_pool.sh`:
+
+    ```shell
+    # Decode node 0, DP ranks 0-3
+    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 0 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
+
+    # Decode node 1, DP ranks 4-7
+    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 4 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
+
+    # Decode node 2, DP ranks 8-11
+    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 8 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
+
+    # Decode node 3, DP ranks 12-15
+    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 12 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
+    ```
+
+4. After the Prefill and Decode APIs are ready, start the proxy on a host
+   that can reach every endpoint:
+
+```shell
+python examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py --host 0.0.0.0 --port 1999 --workers 8 --prefiller-hosts <PREFILL_NODE0_IP> <PREFILL_NODE2_IP> --prefiller-ports 8000 8000 --decoder-hosts <DECODE_NODE0_IP> <DECODE_NODE0_IP> <DECODE_NODE0_IP> <DECODE_NODE0_IP> <DECODE_NODE1_IP> <DECODE_NODE1_IP> <DECODE_NODE1_IP> <DECODE_NODE1_IP> <DECODE_NODE2_IP> <DECODE_NODE2_IP> <DECODE_NODE2_IP> <DECODE_NODE2_IP> <DECODE_NODE3_IP> <DECODE_NODE3_IP> <DECODE_NODE3_IP> <DECODE_NODE3_IP> --decoder-ports 10010 10011 10012 10013 10010 10011 10012 10013 10010 10011 10012 10013 10010 10011 10012 10013
+```
+
+###### 5.1.3.5.5 Verify Pooling
+
+Send requests to the proxy using the served model name `glm5`. Keep
+thinking enabled (Section 5 note). Then verify that reuse actually comes
+from the shared pool, not only from an engine-local prefix cache:
+
+1. Warm the pool with a prompt longer than one cache block, then repeat
+   requests with the same prefix.
+2. Inspect MemCache saves, lookups, loads, and hit metrics
+   (`ock.mmc.log_level = info` in `mmc-meta.conf` logs them; a pool load
+   when the prefix is absent from the engine's local cache is the
+   evidence of shared-pool reuse — a local prefix-cache hit alone does
+   not demonstrate pooling).
+3. Check the vLLM connector statistics for
+   `connector_prefix_cache_stats` hits on the Prefill side.
+
+Key parameters:
+
+- **Two independent Prefill instances**: each is a TP8 × PP2 deployment
+  over two nodes (`--nnodes 2`, PP partition `42,36` pinned via
+  `VLLM_PP_LAYER_PARTITION` and the connector's `pp_layer_partition` —
+  these must stay consistent). The proxy round-robins between them.
+- **MultiConnector on both roles**: `MooncakeConnectorV2` (P2P KV
+  transfer, `use_ascend_direct`) plus `AscendStoreConnector`
+  (`backend: "memcache"`, `use_layerwise: false`). Both sides declare
+  the same topology: `prefill {dp_size 1, pp_size 2, tp_size 8,
+  pp_layer_partition "42,36"}` and `decode {dp_size 16, tp_size 2}`.
+  Both roles and both instances must agree on this declaration or the
+  KV transfer handshake fails.
+- **Base KV ports 30000 (Prefill) and 30200 (Decode)**; each engine
+  derives its side-channel ports from `kv_port + dp_rank × tp × pp`, so
+  reserve the derived ranges too. `lookup_rpc_port "0"` is not a TCP
+  listener: Ascend Store uses an IPC endpoint that also includes the DP
+  rank.
+- **Distinct `engine_id` values** (`glm53-a2-prefill-pool-<instance>`,
+   `glm53-a2-decode-pool-dp<rank>`) avoid Mooncake peer-identity conflicts;
+  the same ID is never reused across engines.
+- **Pooling env**: `PYTHONHASHSEED=0` must be identical on every node
+  (pool-key hashing); `MMC_LOCAL_CONFIG_PATH` points at the shared
+  `mmc-local.conf`; `MEMCACHE_ROOT/lib` must be on `LD_LIBRARY_PATH`
+  for the MemCache runtime libraries.
+- **Prefill budget**: eager mode, `--no-async-scheduling`, 16,384-token
+  batch budget, 64 sequences, five MTP tokens, DSA CP + FlashComm1,
+  `max-model-len 200000`, and the chunked-prefill profiling config
+  (`scheduler_config.profiling_chunk_config`).
+- **Decode budget**: 256-token batch budget, 64 sequences, five MTP
+  tokens with an eager draft, `FULL_DECODE_ONLY` graph mode, and
+  `recompute_scheduler_enable=true`, `max-model-len 200000`.
+- **`VLLM_USE_V2_MODEL_RUNNER=0`** pins the V1 model runner on this
+  release, matching the Section 5.1.2.5 value.
+- Both roles use `glm47` tool parser and `glm47` reasoning parser and
+  the served model name `glm5`, int8 KV cache + int8 indexer KV cache,
+  chunked prefill, prefix caching, seed 1024, and memory utilization
+  0.92.
 
 ### 5.2 1M Context Configuration
 
@@ -2352,438 +2784,6 @@ Key Parameter Descriptions:
 - Both roles use int8 KV and indexer KV caches. Prefill enables DSA CP,
   fused MC2 and FlashComm1; Decode enables fused MC2, MLAPO and the
   recomputation scheduler. See [Performance Tuning](#9-performance-tuning).
-
-### 5.3 A2 Series: 8-Node Deployment with MemCache KV Cache Pool
-
-This section adds MemCache KV-cache pooling to an 8-node A2
-prefill-decode deployment of GLM-5.3 W8A8C8 on vLLM v0.30.0. It uses the
-same connector pattern as the A3 pooling guide (Section 5.1.3 of the A3
-reference, PR #18168): `MultiConnector` combines `MooncakeConnectorV2`
-for prefill-to-decode KV transfer with `AscendStoreConnector` for
-non-layerwise MemCache pooling. The pool lets repeated or shared
-prefixes be served from pooled DRAM instead of re-running prefill, which
-is what moves high-repetition workloads from cold-path to warm-path
-TTFT.
-
-!!! warning
-
-    This reference uses a different Prefill topology than Section 5.1.2.5:
-    here each Prefill instance is TP8 × PP2 spanning two nodes, and two
-    such instances run as two separate API servers. The pooled scripts
-    were validated only in this topology — do not combine them with the
-    Section 5.1.2.5 parallel layout.
-
-| Role | Nodes | Parallelism | Placement | Devices per role |
-| --- | --- | --- | --- | --- |
-| Prefill | 4 nodes (2 instances) | TP8 × PP2 per instance | One PP stage per node; instance 0 on nodes 0+1, instance 1 on nodes 2+3 | 32 |
-| Decode | 4 nodes | DP16 × TP2 | Four DP ranks per node (ranks 0-3, 4-7, 8-11, 12-15) | 32 |
-
-Each Prefill instance exposes one API server (ports 8000 on both
-instance leaders); the proxy registers both. Decode keeps the Section
-5.3 arrangement: one 2-device engine per DP rank, coordinated by the
-`launch_online_dp.py` launcher from Section 5.1.2.5.1 (reused unchanged),
-DP RPC master on `<DECODE_NODE0_IP>`:12990, API ports 10010-10013.
-
-#### 5.3.1 Prepare MemCache
-
-Complete [MemCache backend setup](../../user_guide/feature_guide/kv_cache_pool_ascend_store.md#scenario-2-memcache-backend),
-including the `memfabric-hybrid` and `memcache-hybrid` installation and
-the hardware prerequisites. Connector arguments do not start the
-MemCache service; all Prefill and Decode nodes must reach the same
-MetaService.
-
-1. Install on every node:
-
-    ```shell
-    pip install memfabric-hybrid
-    pip install memcache-hybrid
-    ```
-
-2. Prepare `mmc-meta.conf` (used by the MetaService on one node, here
-   `<MEMCACHE_META_IP>`):
-
-    ```ini
-    ock.mmc.meta_service_url = tcp://<MEMCACHE_META_IP>:5000
-    ock.mmc.meta_service.config_store_url = tcp://<MEMCACHE_META_IP>:6000
-    ock.mmc.meta_service.metrics_url = http://<MEMCACHE_META_IP>:8009
-    ock.mmc.log_level = info
-    ```
-
-3. Prepare `mmc-local.conf` in shared storage (or a copy on each node
-   with identical contents), referenced later by `MMC_LOCAL_CONFIG_PATH`.
-   `world_size` must cover every LocalService across both roles (here
-   256 with headroom); `device_rdma` is the A2/RoCE protocol; the pool
-   size is `dram.size` per die across all connected ranks. This reference
-   reserves `40GB` for each LocalService.
-
-    ```ini
-    ock.mmc.meta_service_url = tcp://<MEMCACHE_META_IP>:5000
-    ock.mmc.local_service.config_store_url = tcp://<MEMCACHE_META_IP>:6000
-    ock.mmc.log_level = error
-    ock.mmc.local_service.world_size = 256
-    ock.mmc.local_service.protocol = device_rdma
-    ock.mmc.local_service.dram.size = 40GB
-    ```
-
-4. Set `MEMCACHE_ROOT` to the installed `memcache_hybrid` directory and
-   `PYTHON_LIB_DIR` to the library directory of the Python installation
-   actually used by vLLM on each node (both are used by the scripts
-   below).
-
-#### 5.3.2 Prefill Engine Script (Pooled)
-
-Save the following script as `start_p_pool.sh` on all four Prefill nodes. Each instance spans
-two nodes (`--nnodes 2`, `mp` backend): the instance leader runs
-`node_rank 0` and hosts the API server; its partner runs `node_rank 1`.
-Run it once per node with the node's role.
-
-```shell
-#!/usr/bin/env bash
-set -euo pipefail
-
-NODE_RANK=${1:?"need node_rank (0=instance leader, 1=partner)"}
-PORT=${2:-8000}
-LOCAL_IP=${3:?need local_ip}
-INSTANCE_LEADER_IP=${4:?need instance_leader_ip}
-INSTANCE_ID=${5:?need instance_id}
-
-case "$NODE_RANK" in
-  0) HEADLESS_ARGS="";;                  # instance leader: API server
-  1) HEADLESS_ARGS="--headless";;        # partner node: second PP stage
-  *) echo "node_rank must be 0 or 1" >&2; exit 1;;
-esac
-
-MODEL_PATH=${MODEL_PATH:-/path/to/GLM-5.3-w8a8c8}
-NIC_NAME=${NIC_NAME:?"export NIC_NAME to this node's business interface"}
-MEMCACHE_ROOT=${MEMCACHE_ROOT:?export MEMCACHE_ROOT to the memcache_hybrid install dir}
-PYTHON_LIB_DIR=${PYTHON_LIB_DIR:?export PYTHON_LIB_DIR to the vLLM Python lib dir}
-# Instance leader address: nodes 0+1 form instance 0 (leader = <PREFILL_NODE0_IP>),
-# nodes 2+3 form instance 1 (leader = <PREFILL_NODE2_IP>).
-
-unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
-
-export VLLM_SERVER_DEV_MODE=1
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
-export HCCL_EXEC_TIMEOUT=1800
-export HCCL_CONNECT_TIMEOUT=1800
-# TP8 stays inside one node per PP stage, so HCCL_IF_IP to the business IP is fine here.
-export VLLM_HOST_IP=$LOCAL_IP
-export HCCL_IF_IP=$LOCAL_IP
-export GLOO_SOCKET_IFNAME=$NIC_NAME
-export TP_SOCKET_IFNAME=$NIC_NAME
-export HCCL_SOCKET_IFNAME=$NIC_NAME
-export LD_LIBRARY_PATH="${PYTHON_LIB_DIR}:/usr/local/lib:${LD_LIBRARY_PATH}"
-export HCCL_BUFFSIZE=1024
-export HCCL_OP_EXPANSION_MODE=AIV
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=1
-export VLLM_USE_V2_MODEL_RUNNER=0
-export VLLM_USE_FASTOKENS=1
-export VLLM_PP_LAYER_PARTITION="42,36"
-export PYTHONHASHSEED=0
-export ACL_OP_INIT_MODE=1
-export MMC_LOCAL_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-local.conf"
-export LD_LIBRARY_PATH="${MEMCACHE_ROOT}/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}"
-export ASCEND_LOCAL_COMM_RES='{"version":"1.2"}'
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-exec vllm serve "$MODEL_PATH" \
-  --host 0.0.0.0 \
-  --port "$PORT" \
-  --tensor-parallel-size 8 \
-  --enable-expert-parallel \
-  --pipeline-parallel-size 2 \
-  --distributed-executor-backend mp \
-  --master-addr "$INSTANCE_LEADER_IP" \
-  --master-port 7060 \
-  --nnodes 2 \
-  --node-rank "$NODE_RANK" \
-  --enable-chunked-prefill \
-  --no-async-scheduling \
-  --enable-prefix-caching \
-  --seed 1024 \
-  --served-model-name glm5 \
-  --max-model-len 200000 \
-  --max-num-batched-tokens 16384 \
-  --max-num-seqs 64 \
-  --gpu-memory-utilization 0.92 \
-  --trust-remote-code \
-  --quantization ascend \
-  --safetensors-load-strategy prefetch \
-  --enable-auto-tool-choice \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm47 \
-  --enforce-eager \
-  --kv-cache-dtype int8 \
-  --attention_config.indexer_kv_dtype int8 \
-  --additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":true,"scheduler_config":{"profiling_chunk_config":{"enabled":true}}}' \
-  --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
-  --kv-transfer-config '{
-      "kv_connector": "MultiConnector",
-      "kv_role": "kv_producer",
-      "kv_port": "30000",
-      "engine_id": "glm53-a2-prefill-pool-'"$INSTANCE_ID"'",
-      "kv_connector_extra_config": {
-          "connectors": [
-          {
-              "kv_connector": "MooncakeConnectorV2",
-              "kv_role": "kv_producer",
-              "kv_port": "30000",
-              "kv_connector_extra_config": {
-                  "use_ascend_direct": true,
-                  "prefill": {"dp_size": 1, "pp_size": 2, "tp_size": 8, "pp_layer_partition": "42,36"},
-                  "decode": {"dp_size": 16, "tp_size": 2}
-              }
-          },
-          {
-              "kv_connector": "AscendStoreConnector",
-              "kv_role": "kv_producer",
-              "kv_connector_extra_config": {
-                  "lookup_rpc_port": "0",
-                  "backend": "memcache",
-                  "use_layerwise": false
-              }
-          }
-          ]
-      }
-   }' \
-  $HEADLESS_ARGS
-```
-
-The four Prefill start commands are grouped in Section 5.3.4. The two
-Prefill instances are fully independent vLLM deployments (each with its own
-TCP store on its leader's port 7060); they share only the weight directory,
-the MemCache pool, and the proxy in front of them.
-
-#### 5.3.3 Decode Engine Script (Pooled)
-
-Save the following complete script as `start_d_engine_pool.sh` on all
-four Decode nodes. Set `LOCAL_IP` to the current node's IP in each copy.
-`launch_online_dp.py` (Section 5.1.2.5.1) supplies `$1`-`$7`; the NIC, model,
-and MemCache paths are configured in this script.
-
-```shell
-#!/usr/bin/env bash
-set -euo pipefail
-
-VISIBLE_DEVICES=$1
-PORT=$2
-DP_SIZE=$3
-DP_RANK=$4
-DP_ADDRESS=$5
-DP_RPC_PORT=$6
-TP_SIZE=$7
-MODEL_PATH="<YOUR_MODEL_PATH>"
-
-LOCAL_IP="<CURRENT_DECODE_NODE_IP>"
-NIC_NAME="<NETWORK_INTERFACE>"
-MEMCACHE_ROOT="<MEMCACHE_ROOT>"
-PYTHON_LIB_DIR="<PYTHON_LIB_DIR>"
-
-unset ftp_proxy FTP_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
-
-export VLLM_SERVER_DEV_MODE=1
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
-export HCCL_EXEC_TIMEOUT=1800
-export HCCL_CONNECT_TIMEOUT=1800
-export ASCEND_TRANSFER_TIMEOUT=10000
-# Intra-node TP2: HCCL_IF_IP to the local business IP is fine here.
-export VLLM_HOST_IP=$LOCAL_IP
-export HCCL_IF_IP=$LOCAL_IP
-export GLOO_SOCKET_IFNAME=$NIC_NAME
-export TP_SOCKET_IFNAME=$NIC_NAME
-export HCCL_SOCKET_IFNAME=$NIC_NAME
-export LD_LIBRARY_PATH="${PYTHON_LIB_DIR}:/usr/local/lib:${LD_LIBRARY_PATH}"
-export HCCL_BUFFSIZE=1024
-export HCCL_OP_EXPANSION_MODE=AIV
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=1
-export VLLM_USE_V2_MODEL_RUNNER=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export PYTHONHASHSEED=0
-export ACL_OP_INIT_MODE=1
-export MMC_LOCAL_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-local.conf"
-export LD_LIBRARY_PATH="${MEMCACHE_ROOT}/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}"
-export ASCEND_LOCAL_COMM_RES='{"version":"1.2"}'
-
-exec vllm serve "$MODEL_PATH" \
-  --host 0.0.0.0 \
-  --port "$PORT" \
-  --data-parallel-size "$DP_SIZE" \
-  --data-parallel-rank "$DP_RANK" \
-  --data-parallel-address "$DP_ADDRESS" \
-  --data-parallel-rpc-port "$DP_RPC_PORT" \
-  --tensor-parallel-size "$TP_SIZE" \
-  --enable-expert-parallel \
-  --enable-chunked-prefill \
-  --enable-prefix-caching \
-  --seed 1024 \
-  --served-model-name glm5 \
-  --max-model-len 200000 \
-  --max-num-batched-tokens 256 \
-  --max-num-seqs 64 \
-  --gpu-memory-utilization 0.92 \
-  --async-scheduling \
-  --quantization ascend \
-  --safetensors-load-strategy prefetch \
-  --enable-auto-tool-choice \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm47 \
-  --kv-cache-dtype int8 \
-  --attention_config.indexer_kv_dtype int8 \
-  --additional-config '{"recompute_scheduler_enable":true}' \
-  --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
-  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-  --kv-transfer-config '{
-      "kv_connector": "MultiConnector",
-      "kv_role": "kv_consumer",
-      "kv_port": "30200",
-      "engine_id": "glm53-a2-decode-pool-dp'"$DP_RANK"'",
-      "kv_connector_extra_config": {
-          "connectors": [
-          {
-              "kv_connector": "MooncakeConnectorV2",
-              "kv_role": "kv_consumer",
-              "kv_port": "30200",
-              "kv_connector_extra_config": {
-                  "use_ascend_direct": true,
-                  "prefill": {"dp_size": 1, "pp_size": 2, "tp_size": 8, "pp_layer_partition": "42,36"},
-                  "decode": {"dp_size": 16, "tp_size": 2}
-              }
-          },
-          {
-              "kv_connector": "AscendStoreConnector",
-              "kv_role": "kv_consumer",
-              "kv_connector_extra_config": {
-                  "lookup_rpc_port": "0",
-                  "backend": "memcache",
-                  "use_layerwise": false
-              }
-          }
-          ]
-      }
-   }'
-```
-
-The four Decode start commands are grouped in Section 5.3.4. They use
-`--script ./start_d_engine_pool.sh` and the same launcher arguments as
-Section 5.1.2.5.4.
-
-#### 5.3.4 Start Services
-
-Start services in this order: MemCache MetaService, Prefill, Decode, then
-Proxy.
-
-1. Start the MemCache MetaService on `<MEMCACHE_META_IP>` before any vLLM
-   process:
-
-    ```shell
-    export MMC_META_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-meta.conf"
-    python3 -c "from memcache_hybrid import MetaService; MetaService.main()"
-    ```
-
-2. Start the two Prefill instances. Run each command on its target node and
-   export the shared paths and the instance leader IP on that node:
-
-    ```shell
-    # Prefill node 0: instance 0 leader and API server
-    export MODEL_PATH="<YOUR_MODEL_PATH>"
-    export NIC_NAME="<NETWORK_INTERFACE>"
-    export MEMCACHE_ROOT="<MEMCACHE_ROOT>"
-    export PYTHON_LIB_DIR="<PYTHON_LIB_DIR>"
-    bash start_p_pool.sh 0 8000 <PREFILL_NODE0_IP> <PREFILL_NODE0_IP> 0
-
-    # Prefill node 1: instance 0 partner
-    bash start_p_pool.sh 1 8000 <PREFILL_NODE1_IP> <PREFILL_NODE0_IP> 0
-
-    # Prefill node 2: instance 1 leader and API server
-    bash start_p_pool.sh 0 8000 <PREFILL_NODE2_IP> <PREFILL_NODE2_IP> 1
-
-    # Prefill node 3: instance 1 partner
-    bash start_p_pool.sh 1 8000 <PREFILL_NODE3_IP> <PREFILL_NODE2_IP> 1
-    ```
-
-3. After both Prefill instances are ready, start Decode on all four Decode
-    nodes. Run each command on its target node; `LOCAL_IP` is configured in
-    that node's copy of `start_d_engine_pool.sh`:
-
-    ```shell
-    # Decode node 0, DP ranks 0-3
-    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 0 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
-
-    # Decode node 1, DP ranks 4-7
-    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 4 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
-
-    # Decode node 2, DP ranks 8-11
-    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 8 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
-
-    # Decode node 3, DP ranks 12-15
-    python launch_online_dp.py --script ./start_d_engine_pool.sh --dp-size 16 --tp-size 2 --dp-size-local 4 --dp-rank-start 12 --dp-address "<DECODE_NODE0_IP>" --dp-rpc-port 12990 --vllm-start-port 10010
-    ```
-
-4. After the Prefill and Decode APIs are ready, start the proxy on a host
-   that can reach every endpoint:
-
-```shell
-python examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py --host 0.0.0.0 --port 1999 --workers 8 --prefiller-hosts <PREFILL_NODE0_IP> <PREFILL_NODE2_IP> --prefiller-ports 8000 8000 --decoder-hosts <DECODE_NODE0_IP> <DECODE_NODE0_IP> <DECODE_NODE0_IP> <DECODE_NODE0_IP> <DECODE_NODE1_IP> <DECODE_NODE1_IP> <DECODE_NODE1_IP> <DECODE_NODE1_IP> <DECODE_NODE2_IP> <DECODE_NODE2_IP> <DECODE_NODE2_IP> <DECODE_NODE2_IP> <DECODE_NODE3_IP> <DECODE_NODE3_IP> <DECODE_NODE3_IP> <DECODE_NODE3_IP> --decoder-ports 10010 10011 10012 10013 10010 10011 10012 10013 10010 10011 10012 10013 10010 10011 10012 10013
-```
-
-#### 5.3.5 Verify Pooling
-
-Send requests to the proxy using the served model name `glm5`. Keep
-thinking enabled (Section 5 note). Then verify that reuse actually comes
-from the shared pool, not only from an engine-local prefix cache:
-
-1. Warm the pool with a prompt longer than one cache block, then repeat
-   requests with the same prefix.
-2. Inspect MemCache saves, lookups, loads, and hit metrics
-   (`ock.mmc.log_level = info` in `mmc-meta.conf` logs them; a pool load
-   when the prefix is absent from the engine's local cache is the
-   evidence of shared-pool reuse — a local prefix-cache hit alone does
-   not demonstrate pooling).
-3. Check the vLLM connector statistics for
-   `connector_prefix_cache_stats` hits on the Prefill side.
-
-Key parameters:
-
-- **Two independent Prefill instances**: each is a TP8 × PP2 deployment
-  over two nodes (`--nnodes 2`, PP partition `42,36` pinned via
-  `VLLM_PP_LAYER_PARTITION` and the connector's `pp_layer_partition` —
-  these must stay consistent). The proxy round-robins between them.
-- **MultiConnector on both roles**: `MooncakeConnectorV2` (P2P KV
-  transfer, `use_ascend_direct`) plus `AscendStoreConnector`
-  (`backend: "memcache"`, `use_layerwise: false`). Both sides declare
-  the same topology: `prefill {dp_size 1, pp_size 2, tp_size 8,
-  pp_layer_partition "42,36"}` and `decode {dp_size 16, tp_size 2}`.
-  Both roles and both instances must agree on this declaration or the
-  KV transfer handshake fails.
-- **Base KV ports 30000 (Prefill) and 30200 (Decode)**; each engine
-  derives its side-channel ports from `kv_port + dp_rank × tp × pp`, so
-  reserve the derived ranges too. `lookup_rpc_port "0"` is not a TCP
-  listener: Ascend Store uses an IPC endpoint that also includes the DP
-  rank.
-- **Distinct `engine_id` values** (`glm53-a2-prefill-pool-<instance>`,
-   `glm53-a2-decode-pool-dp<rank>`) avoid Mooncake peer-identity conflicts;
-  the same ID is never reused across engines.
-- **Pooling env**: `PYTHONHASHSEED=0` must be identical on every node
-  (pool-key hashing); `MMC_LOCAL_CONFIG_PATH` points at the shared
-  `mmc-local.conf`; `MEMCACHE_ROOT/lib` must be on `LD_LIBRARY_PATH`
-  for the MemCache runtime libraries.
-- **Prefill budget**: eager mode, `--no-async-scheduling`, 16,384-token
-  batch budget, 64 sequences, five MTP tokens, DSA CP + FlashComm1,
-  `max-model-len 200000`, and the chunked-prefill profiling config
-  (`scheduler_config.profiling_chunk_config`).
-- **Decode budget**: 256-token batch budget, 64 sequences, five MTP
-  tokens with an eager draft, `FULL_DECODE_ONLY` graph mode, and
-  `recompute_scheduler_enable=true`, `max-model-len 200000`.
-- **`VLLM_USE_V2_MODEL_RUNNER=0`** pins the V1 model runner on this
-  release, matching the Section 5.1.2.5 value.
-- Both roles use `glm47` tool parser and `glm47` reasoning parser and
-  the served model name `glm5`, int8 KV cache + int8 indexer KV cache,
-  chunked prefill, prefix caching, seed 1024, and memory utilization
-  0.92.
 
 ## 6 Functional Verification
 
