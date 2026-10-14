@@ -592,7 +592,7 @@ address, DP RPC port, and TP size to each role script as `$1` through `$7`.
       --host 0.0.0.0 \
       --port "$2" \
       --data-parallel-size "$3" \
-      --data-parallel-rank "$4" \
+      --data-parallel-size-local 1 \
       --data-parallel-address "$5" \
       --data-parallel-rpc-port "$6" \
       --tensor-parallel-size "$7" \
@@ -647,7 +647,7 @@ address, DP RPC port, and TP size to each role script as `$1` through `$7`.
     export LOCAL_IP="<PREFILL_NODE1_IP>"
     export NIC_NAME="<PREFILL_NODE1_NIC>"
     export MODEL_PATH="<YOUR_MODEL_PATH>"
-    export SERVER_ROLE_ARGS="--headless"
+    export SERVER_ROLE_ARGS="--headless --data-parallel-start-rank 1"
     exec bash ./run_p.sh "$@"
     ```
 
@@ -922,7 +922,6 @@ address, DP RPC port, and TP size to each role script as `$1` through `$7`.
         --max-model-len 133120 \
         --data-parallel-size 2 \
         --data-parallel-size-local 1 \
-        --data-parallel-start-rank 0 \
         --data-parallel-address $node0_ip \
         --data-parallel-rpc-port 12321 \
         --tensor-parallel-size 8 \
@@ -1370,7 +1369,9 @@ and tenant options, refer to the [KV Cache Pool Deployment Guide](../../user_gui
        `curl /v1/models`.
     3. Start P0 and P1 with the launcher commands from Section 5.2
        (`--dp-rank-start 0` and `1`; P0 serves the API endpoint on port
-       `9081`, while P1 is headless). Wait until both engines answer.
+       `9081`, while P1 is headless). Wait until P0 answers on port `9081` and
+       confirm from the logs that the headless P1 engine has joined the Prefill DP
+       group.
     4. Start the A2 proxy from Section 5.2. Send inference requests to
        `<PREFILL_NODE0_IP>:8081` using the examples in Section 6.
 
