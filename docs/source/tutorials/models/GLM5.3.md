@@ -182,8 +182,11 @@ Common Issues Tip: If you encounter issues, Refer to [Public FAQs](../../faqs.md
         --max-model-len 202752 \
         --max-num-batched-tokens 4096 \
         --trust-remote-code \
-        --gpu-memory-utilization 0.90 \
+        --gpu-memory-utilization 0.92 \
         --quantization ascend \
+        --enable-chunked-prefill \
+        --enable-prefix-caching \
+        --async-scheduling \
         --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
         --kv-cache-dtype int8 \
         --attention_config.indexer_kv_dtype int8 \
@@ -220,6 +223,7 @@ Common Issues Tip: If you encounter issues, Refer to [Public FAQs](../../faqs.md
     vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5.3-w8a8c8 \
         --host 0.0.0.0 \
         --port 8000 \
+        --safetensors-load-strategy prefetch \
         --headless \
         --data-parallel-size 8 \
         --data-parallel-start-rank 4 \
@@ -406,6 +410,12 @@ maximum sequence length for the 198K workload. It uses one Prefill engine
 spanning P0/P1 with TP16 and PP2, and sixteen TP2 Decode engines on D0/D1.
 The following A2 reference uses a separate eight-node topology. Section 5.1.3
 adds MemCache KV pooling to the A3 deployment.
+
+!!! caution
+
+    Keep `MooncakeConnectorV2` for these P/D layouts. Do not substitute a V1
+    or Hybrid connector: their port-derived remote-host lookup can select an
+    incorrect peer in non-uniform DP x TP topologies and cause requests to hang.
 
 ##### 5.1.2.1 A3 Series: Topology and Prerequisites
 
@@ -956,7 +966,7 @@ single-node-group guides:
 !!! warning "Version requirements"
 
     This reference configuration was validated on **vLLM v0.30.0** with the
-    V1 model runner (`VLLM_USE_V1=1`). The flag surface differs from other
+    V1 model runner (`VLLM_USE_V2_MODEL_RUNNER=0`). The flag surface differs from other
     releases: on 0.30.0 multi-node `--nnodes` forces TCP rendezvous, and
     `--headless` must be passed on every non-API-server node.
 
@@ -998,7 +1008,7 @@ directly instead of being started as independent DP processes.
 
 Save the following complete script as `start_p_engine.sh`. One copy
 serves all four Prefill nodes; the node role is selected by `$1`
-(`node_rank`).
+(`node_rank`) and the local visible devices are supplied as `$4`.
 
 ```shell
 #!/usr/bin/env bash
@@ -1007,6 +1017,7 @@ set -euo pipefail
 NODE_RANK=${1:?need node_rank}
 PORT=${2:-8077}
 LOCAL_IP=${3:?need local_ip}
+VISIBLE_DEVICES=${4:-0,1,2,3,4,5,6,7}
 
 # ---- Per-node role (the only difference between the four nodes) ----
 case "$NODE_RANK" in
@@ -1054,10 +1065,11 @@ export HCCL_BUFFSIZE=1024
 export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1
-export VLLM_USE_V1=1
+export VLLM_USE_V2_MODEL_RUNNER=0
 export CPU_AFFINITY_CONF=1
 export ACL_OP_INIT_MODE=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
+export VLLM_USE_FASTOKENS=1
 
 exec vllm serve "$MODEL_PATH" \
   --host 0.0.0.0 \
@@ -1076,7 +1088,7 @@ exec vllm serve "$MODEL_PATH" \
   --enable-prefix-caching \
   --seed 1024 \
   --served-model-name glm5 \
-  --max-model-len 200000 \
+  --max-model-len 135000 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 64 \
   --gpu-memory-utilization 0.92 \
@@ -1090,7 +1102,7 @@ exec vllm serve "$MODEL_PATH" \
   --tool-call-parser glm47 \
   --reasoning-parser glm47 \
   --speculative-config \
-  '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}' \
+  '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}' \
   --additional-config \
   '{"enable_dsa_cp": true, "enable_fused_mc2": 1, "enable_flashcomm1": true, "ascend_compilation_config": {"fuse_muls_add": true}}' \
   --kv-transfer-config \
@@ -1151,12 +1163,10 @@ export HCCL_BUFFSIZE=1024
 export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1
-export VLLM_USE_V1=1
+export VLLM_USE_V2_MODEL_RUNNER=0
 export CPU_AFFINITY_CONF=1
 export ACL_OP_INIT_MODE=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export VLLM_MOONCAKE_ZMQ_RETRIES=20
-export VLLM_MOONCAKE_ZMQ_RETRY_SLEEP=0.5
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
 
 exec vllm serve "$MODEL_PATH" \
   --host 0.0.0.0 \
@@ -1171,7 +1181,7 @@ exec vllm serve "$MODEL_PATH" \
   --enable-prefix-caching \
   --seed 1024 \
   --served-model-name glm5 \
-  --max-model-len 200000 \
+  --max-model-len 135000 \
   --max-num-batched-tokens 256 \
   --max-num-seqs 32 \
   --gpu-memory-utilization 0.92 \
@@ -1187,7 +1197,7 @@ exec vllm serve "$MODEL_PATH" \
   --additional-config \
   '{"recompute_scheduler_enable": true, "enable_sparse_sfa_c8": true, "enable_sparse_li_c8": true, "enable_fused_mc2": 1}' \
   --speculative-config \
-  '{"num_speculative_tokens": 5, "method": "deepseek_mtp", "enforce_eager": true}' \
+  '{"num_speculative_tokens": 3, "method": "deepseek_mtp", "enforce_eager": true}' \
   --compilation-config \
   '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --kv-transfer-config \
@@ -1237,16 +1247,16 @@ started nearly simultaneously.
 
     ```shell
     # Prefill node 0
-    bash start_p_engine.sh 0 8077 <PREFILL_NODE0_IP>
+    bash start_p_engine.sh 0 8077 <PREFILL_NODE0_IP> 0,1,2,3,4,5,6,7
 
     # Prefill node 2
-    bash start_p_engine.sh 2 8077 <PREFILL_NODE2_IP>
+    bash start_p_engine.sh 2 8077 <PREFILL_NODE2_IP> 0,1,2,3,4,5,6,7
 
     # Prefill node 1
-    bash start_p_engine.sh 1 8077 <PREFILL_NODE1_IP>
+    bash start_p_engine.sh 1 8077 <PREFILL_NODE1_IP> 0,1,2,3,4,5,6,7
 
     # Prefill node 3
-    bash start_p_engine.sh 3 8077 <PREFILL_NODE3_IP>
+    bash start_p_engine.sh 3 8077 <PREFILL_NODE3_IP> 0,1,2,3,4,5,6,7
     ```
 
 For background launches inside containers, prefer `docker exec -d`
@@ -1275,10 +1285,12 @@ Key parameters:
 - Prefill runs TP16×DP2 over four nodes (`--nnodes 4`, `mp` backend,
   TCP store on node 0:29501, DP RPC 12980). Node 0 is the only API
   server (`--api-server-count 1`); the other three nodes are
-  `--headless`. It runs eager with a 8192-token batch budget, 64
-  sequences, 5 MTP tokens, and enables DSA CP, fused MC2, FlashComm1.
-- Decode runs DP16×TP2 with a 256-token batch budget, 32 sequences,
-  5 MTP tokens with an eager draft, `FULL_DECODE_ONLY` graph mode, and
+  `--headless`. It runs eager with a 135,000-token model length, an
+  8,192-token batch budget, 64 sequences, 3 MTP tokens, and DSA CP,
+  fused MC2, and FlashComm1.
+- Decode runs DP16×TP2 with a 135,000-token model length, a 256-token batch
+  budget, 32 sequences, 3 MTP tokens with an eager draft,
+  `FULL_DECODE_ONLY` graph mode, and
   `recompute_scheduler_enable=true`.
 - On the Prefill side, do **not** set `HCCL_IF_IP` (see the comment in
   Section 5.1.2.5.2): device-side HCCL auto-selects the NPU RoCE interface, and
@@ -1295,9 +1307,8 @@ Key parameters:
   the served model name `glm5`, int8 KV cache + int8 indexer KV cache,
   chunked prefill, prefix caching, async scheduling, seed 1024, memory
   utilization 0.92, and fused MC2.
-- `VLLM_USE_V1=1` selects the V1 model runner on this release; if your
-  build uses `VLLM_USE_V2_MODEL_RUNNER` instead, keep this section's
-  validated value and consult your build's flag surface.
+- `VLLM_USE_V2_MODEL_RUNNER=0` selects the V1 model runner for this
+  validated configuration.
 
 #### 5.1.3 MemCache KV Cache Pool Deployment
 
@@ -1922,7 +1933,7 @@ MetaService.
 Save the following script as `start_p_pool.sh` on all four Prefill nodes. Each instance spans
 two nodes (`--nnodes 2`, `mp` backend): the instance leader runs
 `node_rank 0` and hosts the API server; its partner runs `node_rank 1`.
-Run it once per node with the node's role.
+Run it once per node with the node's role and visible-device list.
 
 ```shell
 #!/usr/bin/env bash
@@ -1933,6 +1944,7 @@ PORT=${2:-8000}
 LOCAL_IP=${3:?need local_ip}
 INSTANCE_LEADER_IP=${4:?need instance_leader_ip}
 INSTANCE_ID=${5:?need instance_id}
+VISIBLE_DEVICES=${6:-0,1,2,3,4,5,6,7}
 
 case "$NODE_RANK" in
   0) HEADLESS_ARGS="";;                  # instance leader: API server
@@ -1973,7 +1985,7 @@ export ACL_OP_INIT_MODE=1
 export MMC_LOCAL_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-local.conf"
 export LD_LIBRARY_PATH="${MEMCACHE_ROOT}/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}"
 export ASCEND_LOCAL_COMM_RES='{"version":"1.2"}'
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
 
 exec vllm serve "$MODEL_PATH" \
   --host 0.0.0.0 \
@@ -2005,7 +2017,7 @@ exec vllm serve "$MODEL_PATH" \
   --kv-cache-dtype int8 \
   --attention_config.indexer_kv_dtype int8 \
   --additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":true,"scheduler_config":{"profiling_chunk_config":{"enabled":true}}}' \
-  --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
+  --speculative-config '{"num_speculative_tokens":3,"method":"deepseek_mtp","enforce_eager":true}' \
   --kv-transfer-config '{
       "kv_connector": "MultiConnector",
       "kv_role": "kv_producer",
@@ -2088,7 +2100,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1
 export VLLM_USE_V2_MODEL_RUNNER=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
 export PYTHONHASHSEED=0
 export ACL_OP_INIT_MODE=1
 export MMC_LOCAL_CONFIG_PATH="${MEMCACHE_ROOT}/config/mmc-local.conf"
@@ -2121,7 +2133,7 @@ exec vllm serve "$MODEL_PATH" \
   --kv-cache-dtype int8 \
   --attention_config.indexer_kv_dtype int8 \
   --additional-config '{"recompute_scheduler_enable":true}' \
-  --speculative-config '{"num_speculative_tokens":5,"method":"deepseek_mtp","enforce_eager":true}' \
+  --speculative-config '{"num_speculative_tokens":3,"method":"deepseek_mtp","enforce_eager":true}' \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --kv-transfer-config '{
       "kv_connector": "MultiConnector",
@@ -2180,16 +2192,16 @@ Proxy.
     export NIC_NAME="<NETWORK_INTERFACE>"
     export MEMCACHE_ROOT="<MEMCACHE_ROOT>"
     export PYTHON_LIB_DIR="<PYTHON_LIB_DIR>"
-    bash start_p_pool.sh 0 8000 <PREFILL_NODE0_IP> <PREFILL_NODE0_IP> 0
+    bash start_p_pool.sh 0 8000 <PREFILL_NODE0_IP> <PREFILL_NODE0_IP> 0 0,1,2,3,4,5,6,7
 
     # Prefill node 1: instance 0 partner
-    bash start_p_pool.sh 1 8000 <PREFILL_NODE1_IP> <PREFILL_NODE0_IP> 0
+    bash start_p_pool.sh 1 8000 <PREFILL_NODE1_IP> <PREFILL_NODE0_IP> 0 0,1,2,3,4,5,6,7
 
     # Prefill node 2: instance 1 leader and API server
-    bash start_p_pool.sh 0 8000 <PREFILL_NODE2_IP> <PREFILL_NODE2_IP> 1
+    bash start_p_pool.sh 0 8000 <PREFILL_NODE2_IP> <PREFILL_NODE2_IP> 1 0,1,2,3,4,5,6,7
 
     # Prefill node 3: instance 1 partner
-    bash start_p_pool.sh 1 8000 <PREFILL_NODE3_IP> <PREFILL_NODE2_IP> 1
+    bash start_p_pool.sh 1 8000 <PREFILL_NODE3_IP> <PREFILL_NODE2_IP> 1 0,1,2,3,4,5,6,7
     ```
 
 3. After both Prefill instances are ready, start Decode on all four Decode
@@ -2259,10 +2271,10 @@ Key parameters:
   `mmc-local.conf`; `MEMCACHE_ROOT/lib` must be on `LD_LIBRARY_PATH`
   for the MemCache runtime libraries.
 - **Prefill budget**: eager mode, `--no-async-scheduling`, 16,384-token
-  batch budget, 64 sequences, five MTP tokens, DSA CP + FlashComm1,
+  batch budget, 64 sequences, three MTP tokens, DSA CP + FlashComm1,
   `max-model-len 200000`, and the chunked-prefill profiling config
   (`scheduler_config.profiling_chunk_config`).
-- **Decode budget**: 256-token batch budget, 64 sequences, five MTP
+- **Decode budget**: 256-token batch budget, 64 sequences, three MTP
   tokens with an eager draft, `FULL_DECODE_ONLY` graph mode, and
   `recompute_scheduler_enable=true`, `max-model-len 200000`.
 - **`VLLM_USE_V2_MODEL_RUNNER=0`** pins the V1 model runner on this
