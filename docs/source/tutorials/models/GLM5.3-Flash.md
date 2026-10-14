@@ -1,4 +1,4 @@
-# GLM-5.3-Flash (Experimental)
+# GLM-5.3-Flash
 
 ## 1 Introduction
 
